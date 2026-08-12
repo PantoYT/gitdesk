@@ -19,16 +19,22 @@ Bez zaleznosci zewnetrznych - sama biblioteka standardowa.
 from __future__ import annotations
 
 import argparse
+import html
 import importlib.util
 import json
 import os
 import re
+import secrets as _secrets
+import socket
 import subprocess
 import sys
 import time
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
@@ -717,6 +723,423 @@ def render_twins(repos: list[Repo]) -> None:
 
 
 # --------------------------------------------------------------------------
+# skan sekretow dla POJEDYNCZEGO repo
+# --------------------------------------------------------------------------
+
+
+def secret_crits(repo: str, doctor) -> list[str]:
+    """Sekrety w JEDNYM repo. doctor.check_secrets() chodzi po calym korzeniu,
+    a przed pushem interesuje nas dokladnie to repo i nic wiecej."""
+    out: list[str] = []
+    listing = _run(repo, "ls-files")
+    if listing is None:
+        return out
+    for rel in listing.splitlines():
+        if rel and doctor.SECRET_FILE_RE.search(rel):
+            out.append(f"sekret w repo: {rel}")
+    st = _run(repo, "status", "--porcelain", "--untracked-files=all") or ""
+    for line in st.splitlines():
+        if line.startswith("??"):
+            rel = line[3:].strip().strip('"')
+            if doctor.SECRET_FILE_RE.search(rel):
+                out.append(f"nieignorowany sekret: {rel}")
+    return out
+
+
+def staged_secrets(repo: str, doctor) -> list[str]:
+    """To samo co hook pre-commit doktora, ale dla wskazanego repo: skanuje
+    WYLACZNIE indeks, po nazwie i po tresci."""
+    bad: list[str] = []
+    staged = _run(repo, "diff", "--cached", "--name-only", "--diff-filter=ACM")
+    if not staged:
+        return bad
+    for rel in staged.splitlines():
+        if not rel:
+            continue
+        if doctor.SECRET_FILE_RE.search(rel):
+            bad.append(f"{rel} - nazwa wskazuje na plik z sekretem")
+            continue
+        try:
+            blob = subprocess.run(["git", "-C", repo, "show", f":{rel}"],
+                                  capture_output=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for label, pat in doctor.SECRET_CONTENT:
+            m = pat.search(blob)
+            if m and not doctor.looks_synthetic(m.group(0)):
+                bad.append(f"{rel} - {label}")
+                break
+    return bad
+
+
+# --------------------------------------------------------------------------
+# akcje
+# --------------------------------------------------------------------------
+
+
+def act(rt, action: str, path: str, msg: str = "") -> tuple[bool, str]:
+    """Jedno miejsce, w ktorym gitdesk pisze po repozytoriach.
+
+    Zabezpieczenia sa tutaj, a nie w UI - przycisk mozna ominac, tej funkcji nie.
+    """
+    r = next((x for x in rt.repos if x.path == path), None)
+    if r is None:
+        return False, "nie znam takiego repo"
+    if r.mode == "archive":
+        return False, "korzen archiwalny - tylko do odczytu"
+    if r.label == FOREIGN and action not in ("fetch", "pull"):
+        return False, "repo oznaczone jako obce - bez akcji zapisujacych"
+
+    if action == "fetch":
+        ok = _run(r.path, "fetch", "--all", "--prune", "--quiet", timeout=90) is not None
+        return ok, "odswiezone" if ok else "fetch nie przeszedl"
+
+    if action == "pull":
+        # --ff-only celowo: zbiorczy merge w 40 repo to nie jest cos,
+        # co chce sie potem odkrecac.
+        out = _run(r.path, "pull", "--ff-only", timeout=120)
+        return (out is not None,
+                "zaktualizowane" if out is not None
+                else "pull odrzucony - historia sie rozjechala, potrzebny recznie")
+
+    if action == "push":
+        crits = secret_crits(r.path, rt.doctor)
+        if crits and r.visibility == "PUBLIC":
+            return False, "PUSH ZABLOKOWANY (repo publiczne): " + "; ".join(crits)
+        out = _run(r.path, "push", timeout=180)
+        return out is not None, "wypchniete" if out is not None else "push nie przeszedl"
+
+    if action == "commit":
+        if not msg.strip():
+            return False, "pusty opis commita"
+        if _run(r.path, "add", "-A") is None:
+            return False, "git add nie przeszedl"
+        bad = staged_secrets(r.path, rt.doctor)
+        if bad:
+            _run(r.path, "reset")
+            return False, "COMMIT ODRZUCONY - sekret w indeksie: " + "; ".join(bad)
+        out = _run(r.path, "commit", "-m", msg, timeout=60)
+        return out is not None, "zacommitowane" if out is not None else "commit nie przeszedl"
+
+    if action == "mark_local":
+        rt.conf.setdefault("labels", {})[r.path] = LOCAL_ONLY
+        config_save(rt.conf)
+        r.label = LOCAL_ONLY
+        return True, "oznaczone jako lokalne z wyboru"
+
+    return False, f"nieznana akcja: {action}"
+
+
+# --------------------------------------------------------------------------
+# panel
+# --------------------------------------------------------------------------
+
+PAGE_CSS = """
+*{box-sizing:border-box}
+body{margin:0;background:#0d0d10;color:#d8d8dd;
+ font:14px/1.5 ui-monospace,"Cascadia Mono",Consolas,monospace}
+a{color:#f0b45e;text-decoration:none}
+header{padding:18px 22px;border-bottom:1px solid #22222a;
+ display:flex;gap:18px;align-items:baseline;flex-wrap:wrap}
+h1{margin:0;font-size:16px;letter-spacing:.14em;text-transform:uppercase;color:#f0b45e}
+.sum{color:#6a6a76;font-size:12px}
+nav{padding:10px 22px;border-bottom:1px solid #22222a;display:flex;gap:6px;flex-wrap:wrap}
+nav a{padding:5px 11px;border:1px solid #2a2a34;border-radius:2px;font-size:12px;color:#9a9aa6}
+nav a.on{background:#f0b45e;color:#0d0d10;border-color:#f0b45e;font-weight:600}
+main{padding:16px 22px 60px}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+ color:#5a5a66;padding:8px 10px;border-bottom:1px solid #22222a;font-weight:600}
+td{padding:8px 10px;border-bottom:1px solid #17171d;vertical-align:middle}
+tr:hover td{background:#131318}
+.nm{font-weight:600;color:#e8e8ee}
+.pth{color:#4a4a56;font-size:11px}
+.tag{display:inline-block;padding:1px 7px;border-radius:2px;font-size:11px;margin-right:5px}
+.crit{background:#5a1f22;color:#ffb4b4}
+.warn{background:#54401a;color:#ffd79a}
+.info{background:#1c3a44;color:#9fdcea}
+.ok{background:#1e3a26;color:#a5e0b5}
+.mut{background:#232330;color:#7a7a88}
+.pub{background:#43204a;color:#e2b0f0}
+form{display:inline}
+button{font:600 11px ui-monospace,monospace;color:#0d0d10;background:#8a8a99;
+ border:0;border-radius:2px;padding:4px 9px;cursor:pointer;margin-right:4px}
+button:hover{background:#f0b45e}
+button.d{background:#2a2a34;color:#9a9aa6}
+button.d:hover{background:#3a3a46;color:#d8d8dd}
+input[type=text]{background:#17171d;border:1px solid #2a2a34;color:#d8d8dd;
+ padding:4px 7px;font:12px ui-monospace,monospace;border-radius:2px;width:230px}
+.bar{margin:0 0 16px;padding:11px 14px;background:#131318;border-left:2px solid #f0b45e}
+.err{border-left-color:#c0484e;color:#ffb4b4}
+.done{border-left-color:#4e9e63;color:#a5e0b5}
+.hint{color:#5a5a66;font-size:11px;margin-top:3px}
+"""
+
+
+class Runtime:
+    def __init__(self, conf, doctor, repos):
+        self.conf = conf
+        self.doctor = doctor
+        self.repos = repos
+        self.token = _secrets.token_urlsafe(24)
+        self.flash: tuple[str, str] | None = None
+
+
+def esc(s) -> str:
+    return html.escape(str(s), quote=True)
+
+
+def page(title: str, body: str) -> bytes:
+    return (f"<!doctype html><html lang=pl><head><meta charset=utf-8>"
+            f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>{esc(title)}</title><style>{PAGE_CSS}</style></head>"
+            f"<body>{body}</body></html>").encode("utf-8")
+
+
+FILTERS = {
+    "wszystko": lambda r: True,
+    "brudne": lambda r: r.dirty > 0,
+    "niewypchniete": lambda r: r.ahead > 0,
+    "z-tylu": lambda r: r.behind > 0,
+    "bez-zdalnego": lambda r: not r.remote and not r.label and r.mode == "rw",
+    "blizniaki": lambda r: bool(r.twin_of),
+    "publiczne": lambda r: r.visibility == "PUBLIC",
+    "nieswieze": lambda r: stale(r),
+}
+
+
+def tags_for(r: Repo) -> str:
+    t = []
+    if r.error:
+        t.append(f"<span class='tag crit'>{esc(r.error)}</span>")
+    if r.dirty:
+        cls = "mut" if r.label == LOCAL_ONLY else "warn"
+        t.append(f"<span class='tag {cls}'>brudne {r.dirty}</span>")
+    if r.ahead:
+        t.append(f"<span class='tag crit'>niewypchniete {r.ahead}</span>")
+    if r.behind:
+        t.append(f"<span class='tag info'>z tylu {r.behind}</span>")
+    if not r.remote:
+        if r.label == LOCAL_ONLY:
+            t.append("<span class='tag mut'>lokalne z wyboru</span>")
+        elif r.label == FOREIGN:
+            t.append("<span class='tag mut'>obce</span>")
+        else:
+            t.append("<span class='tag crit'>BEZ ZDALNEGO</span>")
+    if r.visibility == "PUBLIC":
+        t.append("<span class='tag pub'>publiczne</span>")
+    elif r.visibility == "PRIVATE":
+        t.append("<span class='tag mut'>prywatne</span>")
+    elif r.visibility == "obce":
+        t.append("<span class='tag mut'>obce</span>")
+    if r.verdict:
+        cls = "crit" if "ROZJAZD" in r.verdict else "mut"
+        t.append(f"<span class='tag {cls}'>{esc(r.verdict)}</span>")
+    if not t:
+        t.append("<span class='tag mut'>niezweryfikowane</span>" if stale(r)
+                 else "<span class='tag ok'>czysto</span>")
+    return "".join(t)
+
+
+def buttons_for(r: Repo, token: str) -> str:
+    if r.mode == "archive":
+        return "<span class=pth>archiwum — tylko odczyt</span>"
+
+    def form(action: str, label: str, dim: bool = False, extra: str = "") -> str:
+        return (f"<form method=post action=/akcja>"
+                f"<input type=hidden name=t value='{esc(token)}'>"
+                f"<input type=hidden name=a value='{action}'>"
+                f"<input type=hidden name=p value='{esc(r.path)}'>{extra}"
+                f"<button class='{'d' if dim else ''}'>{label}</button></form>")
+
+    b = []
+    if r.remote:
+        b.append(form("fetch", "fetch", dim=True))
+        if r.behind:
+            b.append(form("pull", f"pull {r.behind}"))
+        if r.ahead and r.label != FOREIGN:
+            b.append(form("push", f"push {r.ahead}"))
+    if r.dirty and r.label != FOREIGN:
+        b.append(form("commit", "commit",
+                      extra="<input type=text name=m placeholder='opis commita' required>"))
+    if not r.remote and not r.label:
+        b.append(form("mark_local", "to jest lokalne z wyboru", dim=True))
+    return "".join(b) or "<span class=pth>—</span>"
+
+
+def render_page(rt: Runtime, flt: str) -> bytes:
+    repos = [r for r in rt.repos if FILTERS.get(flt, FILTERS["wszystko"])(r)]
+    repos.sort(key=lambda r: (r.mode == "archive", norm_key(r.root), norm_key(r.path)))
+
+    nav = "".join(
+        f"<a href='/?f={k}' class='{'on' if k == flt else ''}'>{k}"
+        f" <span style='opacity:.6'>{sum(1 for r in rt.repos if fn(r))}</span></a>"
+        for k, fn in FILTERS.items())
+
+    rows = []
+    for r in repos:
+        rows.append(
+            f"<tr><td><div class=nm>{esc(r.name)}</div>"
+            f"<div class=pth>{esc(r.path)}</div></td>"
+            f"<td class=pth>{esc(r.branch)}</td>"
+            f"<td>{tags_for(r)}</td>"
+            f"<td class=pth>{esc(age(r.fetched_at))}</td>"
+            f"<td>{buttons_for(r, rt.token)}</td></tr>")
+
+    flash = ""
+    if rt.flash:
+        kind, text = rt.flash
+        flash = f"<p class='bar {kind}'>{esc(text)}</p>"
+        rt.flash = None
+
+    dirty = sum(1 for r in rt.repos if r.dirty and r.mode == "rw")
+    unp = sum(1 for r in rt.repos if r.ahead and r.mode == "rw")
+    nor = sum(1 for r in rt.repos if not r.remote and not r.label and r.mode == "rw")
+    tw = len(find_twins(rt.repos))
+    st = sum(1 for r in rt.repos if r.mode == "rw" and stale(r))
+
+    bulk = (f"<form method=post action=/akcja>"
+            f"<input type=hidden name=t value='{esc(rt.token)}'>"
+            f"<input type=hidden name=a value='fetch_all'>"
+            f"<button>odswiez wszystkie ({st} nieswiezych)</button></form>"
+            f"<form method=post action=/akcja>"
+            f"<input type=hidden name=t value='{esc(rt.token)}'>"
+            f"<input type=hidden name=a value='rescan'>"
+            f"<button class=d>przeskanuj dysk</button></form>")
+
+    return page("gitdesk", f"""
+<header><h1>gitdesk</h1>
+<span class=sum>{len(rt.repos)} repo &nbsp;·&nbsp; {dirty} brudnych &nbsp;·&nbsp;
+{unp} niewypchnietych &nbsp;·&nbsp; {nor} bez zdalnego do decyzji &nbsp;·&nbsp;
+{tw} grup blizniakow</span>
+<span style='margin-left:auto'>{bulk}</span></header>
+<nav>{nav}</nav>
+<main>{flash}
+<table><tr><th>repozytorium</th><th>galaz</th><th>stan</th><th>fetch</th><th>akcje</th></tr>
+{''.join(rows) or "<tr><td colspan=5 class=pth>nic w tym filtrze</td></tr>"}</table>
+<p class=hint>Werdykt „zgodne" wymaga fetcha mlodszego niz doba — inaczej
+„niezweryfikowane". Pull zawsze --ff-only. Push zablokowany, gdy repo jest
+publiczne, a skan znajduje sekret.</p>
+</main>""")
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "gitdesk"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+    rt: Runtime = None          # podstawiane przez serve()
+
+    def _send(self, body: bytes, code=200, ctype="text/html; charset=utf-8", extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in (extra or []):
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        if u.path == "/":
+            flt = parse_qs(u.query).get("f", ["wszystko"])[0]
+            return self._send(render_page(self.rt, flt))
+        if u.path == "/json":
+            return self._send(
+                json.dumps([asdict(r) for r in self.rt.repos],
+                           ensure_ascii=False).encode("utf-8"),
+                ctype="application/json; charset=utf-8")
+        self._send(page("404", "<main><p>Nie ma takiej strony.</p></main>"), code=404)
+
+    def do_POST(self):
+        if urlparse(self.path).path != "/akcja":
+            return self._send(page("404", "<main>404</main>"), code=404)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        form = parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+        token = (form.get("t") or [""])[0]
+
+        # Token sesji: bez niego dowolna strona otwarta w tej samej przegladarce
+        # moglaby wyslac POST-a i wysterowac panel.
+        if not _secrets.compare_digest(token, self.rt.token):
+            self.rt.flash = ("err", "zly token sesji - odswiez strone")
+            return self._redirect()
+
+        action = (form.get("a") or [""])[0]
+        path = (form.get("p") or [""])[0]
+        msg = (form.get("m") or [""])[0]
+
+        if action == "rescan":
+            self.rt.repos = scan(self.rt.conf, do_fetch=False,
+                                 do_vis=bool(self.rt.conf.get("owner")))
+            self.rt.flash = ("done", f"przeskanowane: {len(self.rt.repos)} repo")
+            return self._redirect()
+
+        if action == "fetch_all":
+            ok, fail = fetch_all(self.rt.repos)
+            self.rt.repos = scan(self.rt.conf, do_fetch=False, do_vis=False)
+            self.rt.flash = ("done" if not fail else "err",
+                             f"odswiezone: {ok} ok, {fail} nieudanych")
+            return self._redirect()
+
+        good, note = act(self.rt, action, path, msg)
+        name = Path(path).name if path else "?"
+        self.rt.flash = ("done" if good else "err", f"{name}: {note}")
+        # stan repo po akcji jest inny - przeliczamy, zeby tabela nie klamala
+        self.rt.repos = scan(self.rt.conf, do_fetch=False, do_vis=False)
+        self._redirect()
+
+    def _redirect(self):
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def free_port(preferred: int) -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", preferred))
+        s.close()
+        return preferred
+    except OSError:
+        s.close()
+        s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s2.bind(("127.0.0.1", 0))
+        p = s2.getsockname()[1]
+        s2.close()
+        return p
+
+
+def serve(conf: dict, doctor, repos: list[Repo], open_browser: bool = True) -> int:
+    port = free_port(int(conf.get("port", 7420)))
+    Handler.rt = Runtime(conf, doctor, repos)
+    # Tylko petla zwrotna. Ten panel pozwala pushowac i commitowac w 50 repo -
+    # nie ma go po co wystawiac dalej niz wlasny komputer.
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd.daemon_threads = True
+    url = f"http://127.0.0.1:{port}/"
+    print(f"gitdesk: {url}   (Ctrl+C konczy)", file=sys.stderr)
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nzakonczone.", file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -767,8 +1190,7 @@ def main() -> int:
     elif args.cmd == "scan":
         print(f"Znalazlem {len(repos)} repozytoriow, zapisalem {INDEX_PATH}")
     elif args.cmd == "serve":
-        print("Panel jeszcze niegotowy - faza 3.", file=sys.stderr)
-        return 2
+        return serve(conf, doctor, repos)
     else:
         render_list(repos, conf)
         render_deployments(check_deployments(conf, doctor))
