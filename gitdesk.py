@@ -873,7 +873,35 @@ input[type=text]{background:#17171d;border:1px solid #2a2a34;color:#d8d8dd;
 .err{border-left-color:#c0484e;color:#ffb4b4}
 .done{border-left-color:#4e9e63;color:#a5e0b5}
 .hint{color:#5a5a66;font-size:11px;margin-top:3px}
+
+/* widok kafelkowy */
+.grid{display:grid;gap:12px;
+ grid-template-columns:repeat(auto-fill,minmax(290px,1fr))}
+.card{background:#131318;border:1px solid #22222a;border-radius:4px;padding:13px 14px;
+ border-left:3px solid #2a2a34}
+.card:hover{border-color:#33333f;border-left-color:#f0b45e}
+.card.a{border-left-color:#c0484e}
+.card.w{border-left-color:#d0a050}
+.card.g{border-left-color:#4e9e63}
+.card.m{border-left-color:#3a3a46;opacity:.62}
+.card h3{margin:0 0 2px;font-size:14px;color:#e8e8ee}
+.card .br{color:#6a6a76;font-size:11px;margin-bottom:8px}
+.card .tg{margin-bottom:10px;line-height:2}
+.card .ac{border-top:1px solid #1f1f27;padding-top:9px}
+.card input[type=text]{width:100%;margin-bottom:5px}
+
+/* widok grupowy */
+.grp{margin-bottom:20px;border:1px solid #22222a;border-radius:4px;overflow:hidden}
+.grp>h2{margin:0;padding:9px 13px;background:#17171d;font-size:12px;font-weight:600;
+ letter-spacing:.05em;color:#f0b45e}
+.grp>h2 small{color:#5a5a66;font-weight:400;letter-spacing:0;margin-left:8px}
+.grp.split>h2{background:#2a1618;color:#ffb4b4}
+.grp table{margin:0}
+.grp td{border-bottom:1px solid #17171d}
+.grp tr:last-child td{border-bottom:0}
 """
+
+VIEWS = ("lista", "kafelki", "grupy")
 
 
 class Runtime:
@@ -883,6 +911,9 @@ class Runtime:
         self.repos = repos
         self.token = _secrets.token_urlsafe(24)
         self.flash: tuple[str, str] | None = None
+        # zapamietane, zeby przekierowanie po akcji wracalo tam, gdzie bylo
+        self.view = "lista"
+        self.filter = "wszystko"
 
 
 def esc(s) -> str:
@@ -967,24 +998,86 @@ def buttons_for(r: Repo, token: str) -> str:
     return "".join(b) or "<span class=pth>—</span>"
 
 
-def render_page(rt: Runtime, flt: str) -> bytes:
+def card_class(r: Repo) -> str:
+    """Kolor lewej krawedzi kafelka - to, co ma rzucic sie w oczy z odleglosci."""
+    if r.mode == "archive" or r.label in (LOCAL_ONLY, FOREIGN):
+        return "m"
+    if r.error or r.ahead or (not r.remote and not r.label) or "ROZJAZD" in r.verdict:
+        return "a"
+    if r.dirty or r.behind:
+        return "w"
+    return "m" if stale(r) else "g"
+
+
+def as_table(repos: list[Repo], token: str) -> str:
+    rows = "".join(
+        f"<tr><td><div class=nm>{esc(r.name)}</div>"
+        f"<div class=pth>{esc(r.path)}</div></td>"
+        f"<td class=pth>{esc(r.branch)}</td>"
+        f"<td>{tags_for(r)}</td>"
+        f"<td class=pth>{esc(age(r.fetched_at))}</td>"
+        f"<td>{buttons_for(r, token)}</td></tr>" for r in repos)
+    if not rows:
+        rows = "<tr><td colspan=5 class=pth>nic w tym filtrze</td></tr>"
+    return ("<table><tr><th>repozytorium</th><th>galaz</th><th>stan</th>"
+            f"<th>fetch</th><th>akcje</th></tr>{rows}</table>")
+
+
+def as_tiles(repos: list[Repo], token: str) -> str:
+    if not repos:
+        return "<p class=pth>nic w tym filtrze</p>"
+    cards = "".join(
+        f"<div class='card {card_class(r)}'>"
+        f"<h3>{esc(r.name)}</h3>"
+        f"<div class=br>{esc(r.branch)} &nbsp;·&nbsp; fetch {esc(age(r.fetched_at))}</div>"
+        f"<div class=tg>{tags_for(r)}</div>"
+        f"<div class=pth style='margin-bottom:9px'>{esc(r.path)}</div>"
+        f"<div class=ac>{buttons_for(r, token)}</div></div>" for r in repos)
+    return f"<div class=grid>{cards}</div>"
+
+
+def as_groups(repos: list[Repo], token: str) -> str:
+    """Grupowanie po zdalnym. Kopie robocze tego samego repo trafiaja obok
+    siebie - a o to w tym narzedziu chodzi od poczatku."""
+    groups: dict[str, list[Repo]] = {}
+    solo: list[Repo] = []
+    for r in repos:
+        (groups.setdefault(r.remote_key, []) if r.remote_key else solo).append(r)
+
+    multi = {k: v for k, v in groups.items() if len(v) > 1}
+    single = [v[0] for k, v in groups.items() if len(v) == 1]
+
+    out = []
+    for key, members in sorted(multi.items()):
+        members.sort(key=lambda r: (r.mode == "archive", norm_key(r.path)))
+        split = any("ROZJAZD" in m.verdict for m in members)
+        live = sum(1 for m in members if m.mode == "rw")
+        out.append(
+            f"<div class='grp {'split' if split else ''}'>"
+            f"<h2>{esc(key)}<small>{len(members)} kopii roboczych"
+            f"{'' if live == len(members) else f', w tym {len(members) - live} archiwalnych'}"
+            f"</small></h2>{as_table(members, token)}</div>")
+
+    rest = sorted(single + solo, key=lambda r: norm_key(r.path))
+    if rest:
+        out.append(f"<div class=grp><h2>pojedyncze<small>{len(rest)} repo, "
+                   f"jedna kopia robocza</small></h2>{as_table(rest, token)}</div>")
+    return "".join(out) or "<p class=pth>nic w tym filtrze</p>"
+
+
+def render_page(rt: Runtime, flt: str, view: str = "lista") -> bytes:
     repos = [r for r in rt.repos if FILTERS.get(flt, FILTERS["wszystko"])(r)]
     repos.sort(key=lambda r: (r.mode == "archive", norm_key(r.root), norm_key(r.path)))
 
     nav = "".join(
-        f"<a href='/?f={k}' class='{'on' if k == flt else ''}'>{k}"
+        f"<a href='/?f={k}&w={view}' class='{'on' if k == flt else ''}'>{k}"
         f" <span style='opacity:.6'>{sum(1 for r in rt.repos if fn(r))}</span></a>"
         for k, fn in FILTERS.items())
+    switch = "".join(
+        f"<a href='/?f={flt}&w={v}' class='{'on' if v == view else ''}'>{v}</a>"
+        for v in VIEWS)
 
-    rows = []
-    for r in repos:
-        rows.append(
-            f"<tr><td><div class=nm>{esc(r.name)}</div>"
-            f"<div class=pth>{esc(r.path)}</div></td>"
-            f"<td class=pth>{esc(r.branch)}</td>"
-            f"<td>{tags_for(r)}</td>"
-            f"<td class=pth>{esc(age(r.fetched_at))}</td>"
-            f"<td>{buttons_for(r, rt.token)}</td></tr>")
+    body = {"kafelki": as_tiles, "grupy": as_groups}.get(view, as_table)(repos, rt.token)
 
     flash = ""
     if rt.flash:
@@ -1013,10 +1106,8 @@ def render_page(rt: Runtime, flt: str) -> bytes:
 {unp} niewypchnietych &nbsp;·&nbsp; {nor} bez zdalnego do decyzji &nbsp;·&nbsp;
 {tw} grup blizniakow</span>
 <span style='margin-left:auto'>{bulk}</span></header>
-<nav>{nav}</nav>
-<main>{flash}
-<table><tr><th>repozytorium</th><th>galaz</th><th>stan</th><th>fetch</th><th>akcje</th></tr>
-{''.join(rows) or "<tr><td colspan=5 class=pth>nic w tym filtrze</td></tr>"}</table>
+<nav>{nav}<span style='margin-left:auto;display:flex;gap:6px'>{switch}</span></nav>
+<main>{flash}{body}
 <p class=hint>Werdykt „zgodne" wymaga fetcha mlodszego niz doba — inaczej
 „niezweryfikowane". Pull zawsze --ff-only. Push zablokowany, gdy repo jest
 publiczne, a skan znajduje sekret.</p>
@@ -1044,8 +1135,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/":
-            flt = parse_qs(u.query).get("f", ["wszystko"])[0]
-            return self._send(render_page(self.rt, flt))
+            q = parse_qs(u.query)
+            flt = q.get("f", ["wszystko"])[0]
+            view = q.get("w", ["lista"])[0]
+            if view not in VIEWS:
+                view = "lista"
+            self.rt.view, self.rt.filter = view, flt
+            return self._send(render_page(self.rt, flt, view))
         if u.path == "/json":
             return self._send(
                 json.dumps([asdict(r) for r in self.rt.repos],
@@ -1095,7 +1191,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _redirect(self):
         self.send_response(303)
-        self.send_header("Location", "/")
+        self.send_header("Location", f"/?f={self.rt.filter}&w={self.rt.view}")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
