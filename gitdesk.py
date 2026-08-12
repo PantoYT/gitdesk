@@ -357,13 +357,20 @@ def probe(entry: dict, labels: dict) -> Repo:
     if ts.isdigit():
         r.last_commit = int(ts)
 
-    # czas ostatniego fetcha - git zapisuje go jako mtime FETCH_HEAD
-    fh = Path(r.path) / ".git" / "FETCH_HEAD"
-    try:
-        if fh.exists():
-            r.fetched_at = int(fh.stat().st_mtime)
-    except OSError:
-        pass
+    # Czas ostatniego kontaktu ze zdalnym. FETCH_HEAD jest najpewniejszy, ale
+    # SWIEZY KLON go nie ma - a swiezy klon ma z definicji aktualne refy zdalne.
+    # Bez tego zapasowego tropu kazde nowo sklonowane repo klamaloby, ze jego
+    # stan jest nieznany.
+    gitdir = Path(r.path) / ".git"
+    newest = 0
+    for cand in (gitdir / "FETCH_HEAD", gitdir / "packed-refs",
+                 gitdir / "refs" / "remotes"):
+        try:
+            if cand.exists():
+                newest = max(newest, int(cand.stat().st_mtime))
+        except OSError:
+            continue
+    r.fetched_at = newest
 
     return r
 
@@ -1280,14 +1287,44 @@ def free_port(preferred: int) -> int:
         return p
 
 
-def serve(conf: dict, doctor, repos: list[Repo], open_browser: bool = True) -> int:
+def tailnet_ip() -> str | None:
+    """Adres tego hosta w Tailscale, jesli klient chodzi."""
+    for exe in ("tailscale", r"C:\Program Files\Tailscale\tailscale.exe"):
+        try:
+            out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True,
+                                 timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.returncode == 0:
+            addr = out.stdout.strip().splitlines()
+            if addr:
+                return addr[0].strip()
+    return None
+
+
+def serve(conf: dict, doctor, repos: list[Repo], bind: str = "local",
+          open_browser: bool = True) -> int:
+    # Domyslnie WYLACZNIE petla zwrotna. Ten panel wykonuje commit, reset, push
+    # i pull na kilkudziesieciu repo, uzywajac poswiadczen, ktore maszyna juz ma
+    # - nie ma tu tokenu do wykradzenia, bo zaden nie jest potrzebny. Kto dojdzie
+    # do panelu, pushuje jako wlasciciel konta. Dlatego zadnego tunelu; jesli
+    # potrzebny jest dostep z telefonu, wlasciwa odpowiedzia jest siec prywatna,
+    # gdzie uwierzytelnieniem jest tozsamosc WireGuarda.
+    host = "127.0.0.1"
+    if bind == "tailnet":
+        ip = tailnet_ip()
+        if not ip:
+            print("Nie znalazlem adresu Tailscale - zostaje 127.0.0.1.", file=sys.stderr)
+        else:
+            host = ip
+            print(f"UWAGA: panel widoczny dla CALEGO tailnetu ({ip}). Kazde "
+                  f"urzadzenie w tej sieci moze pushowac Twoimi poswiadczeniami.",
+                  file=sys.stderr)
     port = free_port(int(conf.get("port", 7420)))
     Handler.rt = Runtime(conf, doctor, repos)
-    # Tylko petla zwrotna. Ten panel pozwala pushowac i commitowac w 50 repo -
-    # nie ma go po co wystawiac dalej niz wlasny komputer.
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.daemon_threads = True
-    url = f"http://127.0.0.1:{port}/"
+    url = f"http://{host}:{port}/"
     print(f"gitdesk: {url}   (Ctrl+C konczy)", file=sys.stderr)
     if open_browser:
         try:
@@ -1299,6 +1336,132 @@ def serve(conf: dict, doctor, repos: list[Repo], open_browser: bool = True) -> i
     except KeyboardInterrupt:
         print("\nzakonczone.", file=sys.stderr)
     return 0
+
+
+# --------------------------------------------------------------------------
+# selftest
+# --------------------------------------------------------------------------
+
+
+def selftest() -> int:
+    """Sprawdza rzeczy, ktorych awaria bylaby CICHA.
+
+    Blokada commita z sekretem nie krzyczy, kiedy przestaje dzialac - po prostu
+    przepuszcza. To jedyny element tego narzedzia, ktorego zepsucie zauwazyloby
+    sie dopiero po wycieku, wiec ma wlasny test.
+    """
+    import shutil
+    import tempfile
+
+    conf = config_load()
+    doctor = load_doctor(conf)
+    ok = fail = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal ok, fail
+        if cond:
+            ok += 1
+            print(f"  {C.GREEN}OK{C.OFF}   {name}")
+        else:
+            fail += 1
+            print(f"  {C.RED}BLAD{C.OFF} {name}" + (f"  — {detail}" if detail else ""))
+
+    tmp = Path(tempfile.mkdtemp(prefix="gitdesk-test-"))
+    try:
+        def g(repo: Path, *a: str) -> str | None:
+            return _run(str(repo), *a)
+
+        # ── zdalne "na niby" plus dwie kopie robocze ──────────────────────
+        origin = tmp / "origin.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+        src = tmp / "pc"
+        subprocess.run(["git", "clone", "-q", str(origin), str(src)], check=True)
+        g(src, "config", "user.email", "t@t"); g(src, "config", "user.name", "t")
+        # Globalny gitignore tej maszyny ma '.env' - bez wyzerowania go test
+        # blokady sekretow przechodzilby ZA DARMO: plik nigdy nie trafilby do
+        # indeksu, wiec skan nie mialby czego zlapac, a wynik wygladalby na
+        # sukces. Test ma sprawdzac gitdeska, nie konfiguracje komputera.
+        g(src, "config", "core.excludesFile", "")
+        (src / "a.txt").write_text("1", encoding="utf-8")
+        g(src, "add", "-A"); g(src, "commit", "-qm", "start")
+        g(src, "push", "-q", "-u", "origin", "HEAD")
+        pen = tmp / "pendrive"
+        subprocess.run(["git", "clone", "-q", str(origin), str(pen)], check=True)
+        g(pen, "config", "user.email", "t@t"); g(pen, "config", "user.name", "t")
+
+        labels: dict[str, str] = {}
+        both = [{"path": str(src), "root": str(tmp), "mode": "rw", "medium": "PC"},
+                {"path": str(pen), "root": str(tmp), "mode": "rw", "medium": "pendrive"}]
+
+        repos = probe_all(both, labels)
+        find_twins(repos)
+        check("dwie kopie tego samego zdalnego to blizniaki",
+              all(r.twin_of for r in repos))
+        check("zgodne kopie daja werdykt 'zsynchronizowane'",
+              all("zsynchronizowane" in r.verdict for r in repos),
+              "; ".join(r.verdict for r in repos))
+
+        # ── commit tylko na PC: werdykt ma wskazac wlasciwa kopie ─────────
+        (src / "b.txt").write_text("2", encoding="utf-8")
+        g(src, "add", "-A"); g(src, "commit", "-qm", "tylko na PC")
+        repos = probe_all(both, labels)
+        find_twins(repos)
+        pc = next(r for r in repos if r.medium == "PC")
+        pd = next(r for r in repos if r.medium == "pendrive")
+        check("kopia z commitem jest 'z przodu'", "z przodu o 1" in pc.verdict, pc.verdict)
+        check("werdykt nazywa nosnik drugiej kopii", "pendrive" in pc.verdict, pc.verdict)
+        check("druga kopia nie zglasza sie jako wyprzedzajaca",
+              "z przodu" not in pd.verdict, pd.verdict)
+
+        # ── blokada commita z sekretem ────────────────────────────────────
+        rt = Runtime(conf, doctor, repos)
+        (src / ".env").write_text("OPENAI_API_KEY=sk-QhTvN82wKpLmXr4dYbFj910AcEuZsRoI\n",
+                                  encoding="utf-8")
+        good, note = act(rt, "commit", str(src), "probuje przemycic sekret")
+        check("commit z sekretem ODRZUCONY", not good, note)
+        check("odrzucenie nazywa plik", ".env" in note, note)
+        check("indeks wyczyszczony po odrzuceniu",
+              not (_run(str(src), "diff", "--cached", "--name-only") or "").strip())
+        (src / ".env").unlink()
+
+        # ── zwykly commit ma przejsc ──────────────────────────────────────
+        (src / "c.txt").write_text("3", encoding="utf-8")
+        rt.repos = probe_all(both, labels)
+        good, note = act(rt, "commit", str(src), "zwykla zmiana")
+        check("commit bez sekretu przechodzi", good, note)
+
+        # ── korzen archiwalny odrzuca zapisy ──────────────────────────────
+        arch = [{"path": str(pen), "root": str(tmp), "mode": "archive",
+                 "medium": "archiwum"}]
+        rt.repos = probe_all(arch, labels)
+        good, note = act(rt, "push", str(pen))
+        check("korzen archiwalny odrzuca push", not good, note)
+
+        # ── repo obce: bez akcji zapisujacych ─────────────────────────────
+        rt.repos = probe_all(both, {norm_key(src): FOREIGN})
+        good, note = act(rt, "push", str(src))
+        check("repo 'foreign' odrzuca push", not good, note)
+        good, _ = act(rt, "fetch", str(src))
+        check("repo 'foreign' dopuszcza fetch", good)
+
+        # ── swiezosc: bez fetcha nie ma werdyktu 'zsynchronizowane' ───────
+        rt.repos = probe_all(both, labels)
+        for r in rt.repos:
+            r.ahead = r.behind = 0
+            r.fetched_at = int(time.time()) - 5 * 86400
+        find_twins(rt.repos)
+        check("stary fetch blokuje werdykt 'zsynchronizowane'",
+              all("zsynchronizowane" not in r.verdict for r in rt.repos),
+              "; ".join(r.verdict for r in rt.repos))
+    finally:
+        # Windows trzyma pliki .git na tylko-do-odczytu
+        def unlock(func, path, _):
+            os.chmod(path, 0o700)
+            func(path)
+        shutil.rmtree(tmp, onexc=unlock)
+
+    print(f"\n  {ok} przeszlo, {fail} nie przeszlo\n")
+    return 1 if fail else 0
 
 
 # --------------------------------------------------------------------------
@@ -1320,7 +1483,17 @@ def main() -> int:
     ap.add_argument("--no-gh", action="store_true", help="pomin odpytanie gh o widocznosc")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--bind", choices=["local", "tailnet"], default="local",
+                    help="local (domyslnie, tylko ten komputer) albo tailnet "
+                         "(widoczne dla wszystkich Twoich urzadzen w Tailscale). "
+                         "Przez tunel publiczny NIE wystawiac - panel pushuje "
+                         "Twoimi poswiadczeniami.")
+    ap.add_argument("--selftest", action="store_true",
+                    help="sprawdza blizniaki, blokade sekretow i korzen archiwalny")
     args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
 
     if args.no_color or not sys.stdout.isatty():
         C.disable()
@@ -1352,7 +1525,7 @@ def main() -> int:
     elif args.cmd == "scan":
         print(f"Znalazlem {len(repos)} repozytoriow, zapisalem {INDEX_PATH}")
     elif args.cmd == "serve":
-        return serve(conf, doctor, repos)
+        return serve(conf, doctor, repos, bind=args.bind)
     else:
         render_list(repos, conf)
         render_deployments(check_deployments(conf, doctor))
