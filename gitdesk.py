@@ -51,11 +51,15 @@ LOCAL_ONLY = "local_only"   # celowo bez remote'a, nie proponuj GitHuba
 FOREIGN = "foreign"         # nie moj kod, zero akcji zapisujacych
 
 CONFIG_DEFAULT = {
+    # `medium` to nazwa NOSNIKA, nie ocena. Repo na pendrivie nie jest kopia
+    # zapasowa PC-ta - bywa zrodlem: commit powstaje tam, a PC go zaciaga.
+    # Bez tej etykiety widok grupowy kaze sie domyslac z sciezki, gdzie co lezy.
     "roots": [
-        {"path": r"E:\Pliki\Projects", "mode": "rw"},
-        {"path": r"G:\ ".strip(), "mode": "rw"},
-        {"path": str(Path.home() / "Documents" / "GitHub"), "mode": "rw"},
-        {"path": r"E:\Pliki\Backup", "mode": "archive"},
+        {"path": r"E:\Pliki\Projects", "mode": "rw", "medium": "PC"},
+        {"path": r"G:\ ".strip(), "mode": "rw", "medium": "pendrive"},
+        {"path": str(Path.home() / "Documents" / "GitHub"), "mode": "rw",
+         "medium": "PC/Dokumenty"},
+        {"path": r"E:\Pliki\Backup", "mode": "archive", "medium": "archiwum"},
     ],
     "doctor": "../workspace-doctor/doctor.py",
     "owner": "PantoYT",
@@ -83,13 +87,48 @@ CONFIG_DEFAULT = {
 }
 
 
+def guess_medium(path: str, mode: str) -> str:
+    """Nazwa nosnika z systemu, nie z zaszytej litery dysku.
+
+    Pendrive potrafi wjechac jako G:, H: albo E: - zaleznie od tego, co juz
+    jest wpiete. Zaszyta litera znaczylaby, ze po zmianie portu narzedzie
+    nagle uznaje ten sam nosnik za cos innego.
+    """
+    if mode == "archive":
+        return "archiwum"
+    if os.name != "nt":
+        return "dysk"
+    try:
+        import ctypes
+        drive = str(Path(path).anchor)          # "G:\\"
+        if not drive:
+            return "dysk"
+        kind = ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(drive))
+    except (OSError, AttributeError, ValueError):
+        return "dysk"
+    return {2: "pendrive", 3: "PC", 4: "dysk sieciowy", 5: "plyta",
+            6: "ramdysk"}.get(kind, "dysk")
+
+
 def config_load() -> dict:
     if not CONFIG_PATH.exists():
         CONFIG_PATH.write_text(
             json.dumps(CONFIG_DEFAULT, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"Utworzylem {CONFIG_PATH.name} z domyslnymi ustawieniami.", file=sys.stderr)
-        return json.loads(json.dumps(CONFIG_DEFAULT))
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        conf = json.loads(json.dumps(CONFIG_DEFAULT))
+    else:
+        conf = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+    # Uzupelnienie starszych configow: korzen bez `medium` dostaje nazwe
+    # nosnika wykryta z systemu. Zapisane recznie wartosci zostaja nietkniete.
+    changed = False
+    for root in conf.get("roots", []):
+        if not root.get("medium"):
+            root["medium"] = guess_medium(root["path"], root.get("mode", "rw"))
+            changed = True
+    if changed and CONFIG_PATH.exists():
+        config_save(conf)
+    return conf
 
 
 def config_save(conf: dict) -> None:
@@ -193,7 +232,8 @@ def discover(conf: dict) -> list[dict]:
                 key = norm_key(cur)
                 if key not in seen:
                     seen.add(key)
-                    found.append({"path": str(cur), "root": str(base), "mode": mode})
+                    found.append({"path": str(cur), "root": str(base), "mode": mode,
+                                  "medium": root.get("medium", "")})
                 continue        # nie schodzimy w glab repo
 
             for e in entries:
@@ -222,6 +262,7 @@ class Repo:
     path: str
     root: str
     mode: str = "rw"
+    medium: str = ""            # PC | pendrive | archiwum - nosnik, nie ocena
     name: str = ""
     label: str = ""             # "", local_only, foreign
     branch: str = "?"
@@ -278,7 +319,8 @@ def probe(entry: dict, labels: dict) -> Repo:
     workspace-doctor wolal na to trzy osobne polecenia (remote, status, rev-list)
     - przy 50 repo to widac.
     """
-    r = Repo(path=entry["path"], root=entry["root"], mode=entry.get("mode", "rw"))
+    r = Repo(path=entry["path"], root=entry["root"], mode=entry.get("mode", "rw"),
+             medium=entry.get("medium", ""))
     r.name = Path(r.path).name
     r.label = labels.get(norm_key(r.path), "")
 
@@ -436,7 +478,11 @@ def find_twins(repos: list[Repo]) -> dict[str, list[Repo]]:
         for m in members:
             m.twin_of = [o.path for o in members if o.path != m.path]
             if m.mode == "archive":
-                m.verdict = "archiwum"
+                # Zaden werdykt. Nosnik jest juz osobnym tagiem, a wpisywanie
+                # tu drugi raz "archiwum" sprawialo, ze kolumna STANU krzyczala
+                # "archiwum" przy grupie, w ktorej zywe kopie sa na PC i pendrivie
+                # - i cala grupa czytala sie jako martwa.
+                m.verdict = ""
                 continue
             if len(live) < 2:
                 m.verdict = "jedyna zywa kopia"
@@ -447,18 +493,25 @@ def find_twins(repos: list[Repo]) -> dict[str, list[Repo]]:
             # lokalny commit jest faktem. Ale "zgodne" to twierdzenie o remote,
             # a remote znamy tylko z ostatniego fetcha. Bez swiezych danych
             # zamiast klamac mowimy, ze nie wiemy.
-            if m.ahead and any(o.ahead for o in others):
-                m.verdict = f"ROZJAZD (+{m.ahead})"
+            def where(seq):
+                names = [o.medium or Path(o.path).parent.name for o in seq]
+                return ", ".join(dict.fromkeys(names))
+
+            newer = [o for o in others if o.ahead]
+            if m.ahead and newer:
+                m.verdict = f"ROZJAZD (+{m.ahead}, tez na: {where(newer)})"
             elif m.ahead:
-                m.verdict = f"z przodu o {m.ahead}"
-            elif any(o.ahead for o in others):
-                m.verdict = "z tylu"
+                m.verdict = f"z przodu o {m.ahead} — push, potem pull na: {where(others)}"
+            elif newer:
+                m.verdict = f"z tylu — pull (nowsze na: {where(newer)})"
             elif m.behind or any(o.behind for o in others):
-                m.verdict = "obie za remote"
+                m.verdict = "obie za zdalnym — pull"
             elif stale(m) or any(stale(o) for o in others):
-                m.verdict = "niezweryfikowane"
+                # Nie "martwe" - tylko dawno nieodpytywane. Roznica jest istotna:
+                # te kopie bywaja zrodlem commitow, nie sa kopia zapasowa PC-ta.
+                m.verdict = f"bez fetcha od {age(m.fetched_at)} — stan nieznany"
             else:
-                m.verdict = "zgodne"
+                m.verdict = "zsynchronizowane"
     return twins
 
 
@@ -884,6 +937,7 @@ input[type=text]{background:#17171d;border:1px solid #2a2a34;color:#d8d8dd;
 .card.w{border-left-color:#d0a050}
 .card.g{border-left-color:#4e9e63}
 .card.m{border-left-color:#3a3a46;opacity:.62}
+.card.s{border-left-color:#4a7c8c}
 .card h3{margin:0 0 2px;font-size:14px;color:#e8e8ee}
 .card .br{color:#6a6a76;font-size:11px;margin-bottom:8px}
 .card .tg{margin-bottom:10px;line-height:2}
@@ -939,8 +993,14 @@ FILTERS = {
 }
 
 
+MEDIUM_CLS = {"pendrive": "info", "archiwum": "mut"}
+
+
 def tags_for(r: Repo) -> str:
     t = []
+    if r.medium:
+        t.append(f"<span class='tag {MEDIUM_CLS.get(r.medium, 'mut')}'>"
+                 f"{esc(r.medium)}</span>")
     if r.error:
         t.append(f"<span class='tag crit'>{esc(r.error)}</span>")
     if r.dirty:
@@ -966,9 +1026,11 @@ def tags_for(r: Repo) -> str:
     if r.verdict:
         cls = "crit" if "ROZJAZD" in r.verdict else "mut"
         t.append(f"<span class='tag {cls}'>{esc(r.verdict)}</span>")
-    if not t:
-        t.append("<span class='tag mut'>niezweryfikowane</span>" if stale(r)
-                 else "<span class='tag ok'>czysto</span>")
+    # Sam nosnik to nie jest informacja o stanie - jesli nic poza nim nie doszlo,
+    # repo jest czyste (albo po prostu dawno nieodpytywane).
+    if len(t) <= (1 if r.medium else 0):
+        t.append(f"<span class='tag info'>bez fetcha od {esc(age(r.fetched_at))}</span>"
+                 if stale(r) else "<span class='tag ok'>czysto</span>")
     return "".join(t)
 
 
@@ -999,14 +1061,19 @@ def buttons_for(r: Repo, token: str) -> str:
 
 
 def card_class(r: Repo) -> str:
-    """Kolor lewej krawedzi kafelka - to, co ma rzucic sie w oczy z odleglosci."""
+    """Kolor lewej krawedzi kafelka - to, co ma rzucic sie w oczy z odleglosci.
+
+    Szarosc ('m') jest zarezerwowana dla rzeczy CELOWO wyciszonych: archiwum,
+    lokalne z wyboru, obce. Dawno nieodpytywane repo dostaje wlasny kolor ('s'),
+    bo "nie wiem, jaki masz stan" to nie to samo co "nie interesujesz mnie".
+    """
     if r.mode == "archive" or r.label in (LOCAL_ONLY, FOREIGN):
         return "m"
     if r.error or r.ahead or (not r.remote and not r.label) or "ROZJAZD" in r.verdict:
         return "a"
     if r.dirty or r.behind:
         return "w"
-    return "m" if stale(r) else "g"
+    return "s" if stale(r) else "g"
 
 
 def as_table(repos: list[Repo], token: str) -> str:
@@ -1051,12 +1118,11 @@ def as_groups(repos: list[Repo], token: str) -> str:
     for key, members in sorted(multi.items()):
         members.sort(key=lambda r: (r.mode == "archive", norm_key(r.path)))
         split = any("ROZJAZD" in m.verdict for m in members)
-        live = sum(1 for m in members if m.mode == "rw")
+        media = ", ".join(dict.fromkeys(m.medium or "?" for m in members))
         out.append(
             f"<div class='grp {'split' if split else ''}'>"
-            f"<h2>{esc(key)}<small>{len(members)} kopii roboczych"
-            f"{'' if live == len(members) else f', w tym {len(members) - live} archiwalnych'}"
-            f"</small></h2>{as_table(members, token)}</div>")
+            f"<h2>{esc(key)}<small>{len(members)} kopii roboczych: "
+            f"{esc(media)}</small></h2>{as_table(members, token)}</div>")
 
     rest = sorted(single + solo, key=lambda r: norm_key(r.path))
     if rest:
