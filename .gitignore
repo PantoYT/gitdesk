@@ -1,0 +1,11 @@
+# Uklad dyskow tej maszyny - nie ma powodu, zeby jechal z repo.
+config.json
+
+# Cache skanu.
+state/
+
+__pycache__/
+*.pyc
+.env
+*.pem
+*.key
