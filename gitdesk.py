@@ -36,6 +36,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
 
+# Pod pythonw (czyli przy autostarcie) proces nie ma wlasnej konsoli, wiec KAZDE
+# wywolanie git.exe alokuje sobie wlasne okno. Przy 61 repozytoriach i czterech
+# poleceniach na kazde to kilkaset okien wysypanych na ekran. CREATE_NO_WINDOW
+# to wycisza; na nie-Windowsie flaga nie istnieje i jest zerem.
+NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
 STATE_DIR = HERE / "state"
@@ -306,7 +312,7 @@ def _run(repo: str, *args: str, timeout: int = 60) -> str | None:
         out = subprocess.run(
             ["git", "-C", repo, *args],
             capture_output=True, text=True, timeout=timeout,
-            encoding="utf-8", errors="replace",
+            encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -421,7 +427,7 @@ def visibility_map(owner: str) -> dict[str, str]:
             ["gh", "repo", "list", owner, "--limit", "300",
              "--json", "name,visibility"],
             capture_output=True, text=True, timeout=60,
-            encoding="utf-8", errors="replace",
+            encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -821,7 +827,8 @@ def staged_secrets(repo: str, doctor) -> list[str]:
             continue
         try:
             blob = subprocess.run(["git", "-C", repo, "show", f":{rel}"],
-                                  capture_output=True, timeout=30).stdout
+                                  capture_output=True, timeout=30,
+                                  creationflags=NO_WINDOW).stdout
         except (OSError, subprocess.SubprocessError):
             continue
         for label, pat in doctor.SECRET_CONTENT:
@@ -1391,7 +1398,7 @@ def tailnet_ip() -> str | None:
     for exe in ("tailscale", r"C:\Program Files\Tailscale\tailscale.exe"):
         try:
             out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True,
-                                 timeout=10)
+                                 timeout=10, creationflags=NO_WINDOW)
         except (OSError, subprocess.SubprocessError):
             continue
         if out.returncode == 0:
