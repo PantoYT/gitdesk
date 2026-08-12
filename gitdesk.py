@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
@@ -933,6 +933,9 @@ input[type=text]{background:#17171d;border:1px solid #2a2a34;color:#d8d8dd;
 .err{border-left-color:#c0484e;color:#ffb4b4}
 .done{border-left-color:#4e9e63;color:#a5e0b5}
 .hint{color:#5a5a66;font-size:11px;margin-top:3px}
+a.gl{font-size:11px;padding:4px 8px;border:1px solid #2a2a34;border-radius:2px;
+ margin-right:4px;display:inline-block}
+a.gl:hover{border-color:#f0b45e}
 
 /* widok kafelkowy */
 .grid{display:grid;gap:12px;
@@ -984,7 +987,7 @@ def esc(s) -> str:
 def page(title: str, body: str) -> bytes:
     return (f"<!doctype html><html lang=pl><head><meta charset=utf-8>"
             f"<meta name=viewport content='width=device-width,initial-scale=1'>"
-            f"<title>{esc(title)}</title><style>{PAGE_CSS}</style></head>"
+            f"<title>{esc(title)}</title><style>{PAGE_CSS}{GRAPH_CSS}</style></head>"
             f"<body>{body}</body></html>").encode("utf-8")
 
 
@@ -1064,6 +1067,12 @@ def buttons_for(r: Repo, token: str) -> str:
                       extra="<input type=text name=m placeholder='opis commita' required>"))
     if not r.remote and not r.label:
         b.append(form("mark_local", "to jest lokalne z wyboru", dim=True))
+    b.append(f"<a href='/graf?p={quote(r.path)}' class=gl>graf</a>")
+    if r.twin_of and r.mode == "rw":
+        live = [t for t in r.twin_of if norm_key(t) != norm_key(r.path)]
+        if live:
+            b.append(f"<a href='/graf?p={quote(r.path)}&b={quote(live[0])}' "
+                     f"class=gl>graf blizniakow</a>")
     return "".join(b) or "<span class=pth>—</span>"
 
 
@@ -1187,6 +1196,44 @@ publiczne, a skan znajduje sekret.</p>
 </main>""")
 
 
+def render_graph(rt: Runtime, path: str, other: str, limit: int) -> bytes:
+    limit = max(10, min(limit, 800))
+    r = next((x for x in rt.repos if x.path == path), None)
+    if r is None:
+        return page("graf", "<main><p>Nie znam takiego repo.</p>"
+                            "<p><a href='/'>wroc</a></p></main>")
+
+    back = f"<a href='/?f={rt.filter}&w={rt.view}'>← wroc do listy</a>"
+    head = (f"<header><h1>graf</h1><span class=sum>{esc(r.name)} &nbsp;·&nbsp; "
+            f"{esc(r.medium or '?')} &nbsp;·&nbsp; {esc(r.branch)}</span>"
+            f"<span style='margin-left:auto'>{back}</span></header>")
+
+    if other:
+        b = next((x for x in rt.repos if x.path == other), None)
+        if b is None:
+            body, err = "", "nie znam drugiej kopii"
+        elif r.mode == "archive":
+            # fetch dopisalby obiekty i ref do repo, ktore ma byc nietykalne
+            body, err = "", "kopia archiwalna jest tylko do odczytu"
+        else:
+            body, err = twin_graph(r, b, limit)
+        sub = (f"<p class=hint>A = {esc(r.medium or r.path)} &nbsp;·&nbsp; "
+               f"B = {esc(b.medium if b else other)}. Historia drugiej kopii jest "
+               f"pobierana po sciezce lokalnej do tymczasowego refa i kasowana "
+               f"zaraz po narysowaniu — <code>merge-base</code> miedzy osobnymi "
+               f"klonami nie zadziala, bo to rozne bazy obiektow.</p>")
+        inner = body or f"<p class='bar err'>{esc(err)}</p>"
+        return page(f"graf blizniakow — {r.name}",
+                    head + f"<main>{sub}{inner}</main>")
+
+    nodes = commit_dag(r.path, ["--all"], limit)
+    lanes = assign_lanes(nodes)
+    more = (f"<p class=hint><a href='/graf?p={quote(r.path)}&n={limit * 2}'>"
+            f"pokaz {limit * 2} commitow</a></p>" if len(nodes) >= limit else "")
+    return page(f"graf — {r.name}",
+                head + f"<main>{svg_graph(nodes, lanes)}{more}</main>")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "gitdesk"
     sys_version = ""
@@ -1215,6 +1262,11 @@ class Handler(BaseHTTPRequestHandler):
                 view = "lista"
             self.rt.view, self.rt.filter = view, flt
             return self._send(render_page(self.rt, flt, view))
+        if u.path == "/graf":
+            q = parse_qs(u.query)
+            return self._send(render_graph(self.rt, (q.get("p") or [""])[0],
+                                           (q.get("b") or [""])[0],
+                                           int((q.get("n") or ["150"])[0])))
         if u.path == "/json":
             return self._send(
                 json.dumps([asdict(r) for r in self.rt.repos],
@@ -1339,6 +1391,186 @@ def serve(conf: dict, doctor, repos: list[Repo], bind: str = "local",
 
 
 # --------------------------------------------------------------------------
+# graf historii
+# --------------------------------------------------------------------------
+
+TWIN_REF = "refs/gitdesk/twin"
+LANE_COLORS = ["#f0b45e", "#7fb8d9", "#a5d6a7", "#e0a3c8", "#c9b0e8",
+               "#e8c87f", "#8fd4c4", "#d99f9f"]
+
+
+@dataclass
+class Node:
+    sha: str
+    parents: list[str]
+    when: int
+    who: str
+    subject: str
+    lane: int = 0
+    side: str = ""          # przy grafie blizniakow: "a", "b" albo "ab"
+
+
+def commit_dag(repo: str, refs: list[str], limit: int = 150) -> list[Node]:
+    sep = "\x1f"
+    out = _run(repo, "log", f"--max-count={limit}", "--date-order",
+               f"--format=%H{sep}%P{sep}%ct{sep}%an{sep}%s", *refs)
+    if not out:
+        return []
+    nodes: list[Node] = []
+    for line in out.splitlines():
+        f = line.split(sep)
+        if len(f) < 5:
+            continue
+        nodes.append(Node(sha=f[0], parents=f[1].split() if f[1] else [],
+                          when=int(f[2]) if f[2].isdigit() else 0,
+                          who=f[3], subject=f[4]))
+    return nodes
+
+
+def assign_lanes(nodes: list[Node]) -> int:
+    """Przydzial torow - ten sam pomysl, ktory `git log --graph` rysuje w ASCII.
+
+    Idziemy od najnowszego. `lanes[i]` trzyma sha, ktorego w tym torze
+    oczekujemy. Commit wchodzi w tor, ktory na niego czeka; jesli zaden nie
+    czeka, bierze pierwszy wolny. Pierwszy rodzic dziedziczy tor, kazdy kolejny
+    (czyli merge) otwiera nowy.
+    """
+    lanes: list[str | None] = []
+    for n in nodes:
+        try:
+            idx = lanes.index(n.sha)
+        except ValueError:
+            idx = lanes.index(None) if None in lanes else len(lanes)
+            if idx == len(lanes):
+                lanes.append(None)
+        n.lane = idx
+        lanes[idx] = n.parents[0] if n.parents else None
+        for extra in n.parents[1:]:
+            if extra in lanes:
+                continue
+            j = lanes.index(None) if None in lanes else len(lanes)
+            if j == len(lanes):
+                lanes.append(extra)
+            else:
+                lanes[j] = extra
+    return max((n.lane for n in nodes), default=0) + 1
+
+
+def mark_sides(nodes: list[Node], head_a: str, head_b: str) -> None:
+    """Ktore commity sa osiagalne z ktorej kopii roboczej."""
+    by_sha = {n.sha: n for n in nodes}
+
+    def reach(start: str) -> set[str]:
+        seen, stack = set(), [start]
+        while stack:
+            s = stack.pop()
+            if s in seen or s not in by_sha:
+                continue
+            seen.add(s)
+            stack.extend(by_sha[s].parents)
+        return seen
+
+    ra, rb = reach(head_a), reach(head_b)
+    for n in nodes:
+        n.side = ("ab" if n.sha in ra and n.sha in rb
+                  else "a" if n.sha in ra else "b" if n.sha in rb else "")
+
+
+ROW, COL, PAD = 27, 19, 16
+
+
+def svg_graph(nodes: list[Node], width_lanes: int, twin: bool = False) -> str:
+    if not nodes:
+        return "<p class=pth>Brak commitow do narysowania.</p>"
+    gw = PAD + width_lanes * COL
+    h = PAD + len(nodes) * ROW
+    pos = {n.sha: (PAD + n.lane * COL, PAD + i * ROW) for i, n in enumerate(nodes)}
+
+    edges = []
+    for n in nodes:
+        x1, y1 = pos[n.sha]
+        for p in n.parents:
+            if p not in pos:
+                continue
+            x2, y2 = pos[p]
+            col = LANE_COLORS[n.lane % len(LANE_COLORS)]
+            if x1 == x2:
+                edges.append(f"<path d='M{x1} {y1}V{y2}' stroke='{col}'/>")
+            else:
+                mid = y1 + ROW * 0.62
+                edges.append(f"<path d='M{x1} {y1}V{mid}C{x1} {y2},{x2} {mid},"
+                             f"{x2} {y2}' stroke='{col}'/>")
+
+    dots, rows = [], []
+    for i, n in enumerate(nodes):
+        x, y = pos[n.sha]
+        col = LANE_COLORS[n.lane % len(LANE_COLORS)]
+        merge = len(n.parents) > 1
+        dots.append(f"<circle cx='{x}' cy='{y}' r='{5 if merge else 4}' "
+                    f"fill='{'#0d0d10' if merge else col}' stroke='{col}' "
+                    f"stroke-width='2'/>")
+        badge = ""
+        if twin:
+            lab = {"ab": ("obie", "mut"), "a": ("tylko A", "warn"),
+                   "b": ("tylko B", "info")}.get(n.side)
+            if lab:
+                badge = f"<span class='tag {lab[1]}'>{lab[0]}</span>"
+        when = time.strftime("%Y-%m-%d", time.localtime(n.when)) if n.when else ""
+        rows.append(
+            f"<div class=gr style='height:{ROW}px'>{badge}"
+            f"<code>{esc(n.sha[:7])}</code> <span class=gs>{esc(n.subject[:78])}</span>"
+            f"<span class=gm>{esc(when)} · {esc(n.who)}</span></div>")
+
+    return (f"<div class=gwrap><svg width='{gw}' height='{h}' "
+            f"style='flex:0 0 {gw}px'>"
+            f"<g fill='none' stroke-width='2'>{''.join(edges)}</g>"
+            f"{''.join(dots)}</svg>"
+            f"<div class=glist style='padding-top:{PAD - ROW // 2}px'>"
+            f"{''.join(rows)}</div></div>")
+
+
+def twin_graph(a: Repo, b: Repo, limit: int) -> tuple[str, str]:
+    """Oba ogony na jednym obrazku.
+
+    `git merge-base A B` tu NIE zadziala - to osobne bazy obiektow, kopia z PC
+    nie zna commitow z pendrive'a. Sciagamy wiec glowe B do tymczasowego refa w
+    A (fetch po sciezce lokalnej, bez sieci), rysujemy, i ref kasujemy.
+    """
+    head_a = (_run(a.path, "rev-parse", "HEAD") or "").strip()
+    if not head_a:
+        return "", "nie moge odczytac HEAD pierwszej kopii"
+    fetched = _run(a.path, "fetch", "--no-tags", b.path,
+                   f"+HEAD:{TWIN_REF}", timeout=120)
+    if fetched is None:
+        return "", ("nie udalo sie pobrac historii drugiej kopii "
+                    "(nosnik odlaczony?) — zostaje werdykt tekstowy")
+    try:
+        head_b = (_run(a.path, "rev-parse", TWIN_REF) or "").strip()
+        nodes = commit_dag(a.path, ["HEAD", TWIN_REF], limit)
+        if not nodes:
+            return "", "brak wspolnej historii do narysowania"
+        mark_sides(nodes, head_a, head_b)
+        lanes = assign_lanes(nodes)
+        return svg_graph(nodes, lanes, twin=True), ""
+    finally:
+        # Ref jest tymczasowy z zalozenia - zostawiony smiecilby w repo
+        # uzytkownika i trzymal obiekty przy zyciu.
+        _run(a.path, "update-ref", "-d", TWIN_REF)
+
+
+GRAPH_CSS = """
+.gwrap{display:flex;gap:14px;background:#131318;border:1px solid #22222a;
+ border-radius:4px;padding:8px 12px;overflow-x:auto}
+.glist{flex:1;min-width:0}
+.gr{display:flex;align-items:center;gap:9px;white-space:nowrap;
+ overflow:hidden;text-overflow:ellipsis}
+.gr code{color:#f0b45e;font-size:12px}
+.gs{color:#d8d8dd;font-size:12px;overflow:hidden;text-overflow:ellipsis}
+.gm{margin-left:auto;color:#4a4a56;font-size:11px;padding-left:14px}
+"""
+
+
+# --------------------------------------------------------------------------
 # selftest
 # --------------------------------------------------------------------------
 
@@ -1412,6 +1644,16 @@ def selftest() -> int:
         check("werdykt nazywa nosnik drugiej kopii", "pendrive" in pc.verdict, pc.verdict)
         check("druga kopia nie zglasza sie jako wyprzedzajaca",
               "z przodu" not in pd.verdict, pd.verdict)
+
+        # ── graf blizniakow na ROZJECHANYCH kopiach ───────────────────────
+        svg, err = twin_graph(pc, pd, 50)
+        check("graf blizniakow sie rysuje", bool(svg) and not err, err)
+        check("commit obecny tylko na jednej kopii jest oznaczony",
+              ">tylko A<" in svg, "brak znacznika strony")
+        check("wspolny przodek oznaczony jako obecny w obu", ">obie<" in svg)
+        check("tymczasowy ref posprzatany po narysowaniu",
+              not (_run(str(src), "for-each-ref", "refs/gitdesk/") or "").strip(),
+              "ref zostal w repo")
 
         # ── blokada commita z sekretem ────────────────────────────────────
         rt = Runtime(conf, doctor, repos)
