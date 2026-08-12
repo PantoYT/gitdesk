@@ -1324,6 +1324,53 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def already_running(port: int) -> bool:
+    """Czy pod tym portem siedzi juz gitdesk.
+
+    Przy autostarcie to jest istotne: bez tego kazde logowanie dokladalo by
+    kolejny proces, a drugi z nich - widzac zajety 7420 - wskoczylby na losowy
+    port i panel przestalby byc pod adresem, ktory znasz.
+    """
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3) as r:
+            return b"gitdesk" in r.read(4096)
+    except Exception:
+        return False
+
+
+def install_autostart(remove: bool = False) -> int:
+    """Skrot w Autostarcie uzytkownika. Bez wpisow do rejestru i bez uslugi -
+    ma byc widoczne i usuwalne jednym skasowaniem pliku."""
+    startup = (Path(os.environ.get("APPDATA", Path.home())) / "Microsoft" /
+               "Windows" / "Start Menu" / "Programs" / "Startup")
+    target = startup / "gitdesk.vbs"
+    if remove:
+        if target.exists():
+            target.unlink()
+            print(f"Usuniete: {target}")
+        else:
+            print("Autostartu nie bylo.")
+        return 0
+    if not startup.is_dir():
+        print(f"Nie ma folderu Autostart: {startup}", file=sys.stderr)
+        return 2
+
+    pyw = Path(sys.executable).with_name("pythonw.exe")
+    runner = pyw if pyw.exists() else Path(sys.executable)
+    me = Path(__file__).resolve()
+    # WScript.Shell z oknem 0 = bez migajacej konsoli przy logowaniu
+    target.write_text(
+        'Set s = CreateObject("WScript.Shell")\r\n'
+        f's.Run """{runner}"" ""{me}"" serve --no-browser", 0, False\r\n',
+        encoding="utf-8")
+    print(f"Zainstalowane: {target}")
+    print(f"  uruchamia: {runner} {me} serve --no-browser")
+    print(f"  panel bedzie na http://127.0.0.1:{CONFIG_DEFAULT['port']}/")
+    print("  usuniecie: python gitdesk.py autostart --remove")
+    return 0
+
+
 def free_port(preferred: int) -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -1372,7 +1419,17 @@ def serve(conf: dict, doctor, repos: list[Repo], bind: str = "local",
             print(f"UWAGA: panel widoczny dla CALEGO tailnetu ({ip}). Kazde "
                   f"urzadzenie w tej sieci moze pushowac Twoimi poswiadczeniami.",
                   file=sys.stderr)
-    port = free_port(int(conf.get("port", 7420)))
+    want = int(conf.get("port", 7420))
+    if already_running(want):
+        print(f"gitdesk juz dziala na http://127.0.0.1:{want}/ — nie startuje "
+              f"drugiego.", file=sys.stderr)
+        if open_browser:
+            try:
+                webbrowser.open(f"http://127.0.0.1:{want}/")
+            except Exception:
+                pass
+        return 0
+    port = free_port(want)
     Handler.rt = Runtime(conf, doctor, repos)
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.daemon_threads = True
@@ -1716,8 +1773,12 @@ def main() -> int:
         prog="gitdesk",
         description="Panel nad wszystkimi repozytoriami: commity, pushe, widocznosc, blizniaki.")
     ap.add_argument("cmd", nargs="?", default="list",
-                    choices=["list", "twins", "scan", "serve"],
-                    help="list (domyslne) | twins | scan | serve")
+                    choices=["list", "twins", "scan", "serve", "autostart"],
+                    help="list (domyslne) | twins | scan | serve | autostart")
+    ap.add_argument("--remove", action="store_true",
+                    help="przy 'autostart': usun zamiast instalowac")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="przy 'serve': nie otwieraj przegladarki")
     ap.add_argument("--fetch", action="store_true",
                     help="odswiez remote'y przed raportem (wolniejsze, ale prawdziwe)")
     ap.add_argument("--cached", action="store_true",
@@ -1736,6 +1797,8 @@ def main() -> int:
 
     if args.selftest:
         return selftest()
+    if args.cmd == "autostart":
+        return install_autostart(remove=args.remove)
 
     if args.no_color or not sys.stdout.isatty():
         C.disable()
@@ -1767,7 +1830,8 @@ def main() -> int:
     elif args.cmd == "scan":
         print(f"Znalazlem {len(repos)} repozytoriow, zapisalem {INDEX_PATH}")
     elif args.cmd == "serve":
-        return serve(conf, doctor, repos, bind=args.bind)
+        return serve(conf, doctor, repos, bind=args.bind,
+                     open_browser=not args.no_browser)
     else:
         render_list(repos, conf)
         render_deployments(check_deployments(conf, doctor))
