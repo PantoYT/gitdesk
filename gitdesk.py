@@ -944,6 +944,16 @@ a.gl{font-size:11px;padding:4px 8px;border:1px solid #2a2a34;border-radius:2px;
  margin-right:4px;display:inline-block}
 a.gl:hover{border-color:#f0b45e}
 
+.sbar{padding:11px 22px;border-bottom:1px solid #22222a;display:flex;
+ align-items:center;gap:14px}
+.srch{display:flex;align-items:center;gap:10px;flex:1}
+.srch input[type=search]{flex:1;max-width:560px;background:#17171d;
+ border:1px solid #2a2a34;border-radius:2px;color:#d8d8dd;padding:7px 11px;
+ font:13px ui-monospace,monospace}
+.srch input[type=search]:focus{outline:0;border-color:#f0b45e}
+.srch .clr{font-size:11px;color:#6a6a76}
+.cnt{color:#5a5a66;font-size:11px;white-space:nowrap}
+
 /* widok kafelkowy */
 .grid{display:grid;gap:12px;
  grid-template-columns:repeat(auto-fill,minmax(290px,1fr))}
@@ -985,6 +995,7 @@ class Runtime:
         # zapamietane, zeby przekierowanie po akcji wracalo tam, gdzie bylo
         self.view = "lista"
         self.filter = "wszystko"
+        self.q = ""
 
 
 def esc(s) -> str:
@@ -994,7 +1005,8 @@ def esc(s) -> str:
 def page(title: str, body: str) -> bytes:
     return (f"<!doctype html><html lang=pl><head><meta charset=utf-8>"
             f"<meta name=viewport content='width=device-width,initial-scale=1'>"
-            f"<title>{esc(title)}</title><style>{PAGE_CSS}{GRAPH_CSS}</style></head>"
+            f"<title>{esc(title)}</title>"
+            f"<style>{PAGE_CSS}{GRAPH_CSS}{SETTINGS_CSS}</style></head>"
             f"<body>{body}</body></html>").encode("utf-8")
 
 
@@ -1154,17 +1166,63 @@ def as_groups(repos: list[Repo], token: str) -> str:
     return "".join(out) or "<p class=pth>nic w tym filtrze</p>"
 
 
-def render_page(rt: Runtime, flt: str, view: str = "lista") -> bytes:
-    repos = [r for r in rt.repos if FILTERS.get(flt, FILTERS["wszystko"])(r)]
+def matches(r: Repo, q: str) -> bool:
+    """Szukanie po tym, czym repo faktycznie jest, nie tylko po nazwie katalogu.
+
+    Wpisanie 'pendrive' ma znalezc wszystko z nosnika, 'pantoyt/cpp' - obie
+    kopie tego zdalnego, 'niewypchniete' - to, co czeka na push.
+    """
+    if not q:
+        return True
+    # Do siana wchodza tez POLSKIE odpowiedniki. W danych siedzi 'PUBLIC' i
+    # 'local_only', ale szuka sie po tym, co widac na ekranie.
+    extra = []
+    if r.visibility == "PUBLIC":
+        extra.append("publiczne")
+    elif r.visibility == "PRIVATE":
+        extra.append("prywatne")
+    if r.label == LOCAL_ONLY:
+        extra += ["lokalne", "lokalne z wyboru"]
+    elif r.label == FOREIGN:
+        extra.append("obce")
+    if not r.remote:
+        extra.append("bez zdalnego")
+    if r.dirty:
+        extra.append("brudne")
+    if r.ahead:
+        extra.append("niewypchniete")
+    if r.behind:
+        extra.append("z tylu")
+    if stale(r):
+        extra.append("nieswieze")
+    if r.twin_of:
+        extra.append("blizniak")
+    hay = " ".join((r.name, r.path, r.remote_key, r.branch, r.medium,
+                    r.label, r.verdict, r.visibility, *extra)).lower()
+    return all(word in hay for word in q.lower().split())
+
+
+def render_page(rt: Runtime, flt: str, view: str = "lista", q: str = "") -> bytes:
+    repos = [r for r in rt.repos
+             if FILTERS.get(flt, FILTERS["wszystko"])(r) and matches(r, q)]
     repos.sort(key=lambda r: (r.mode == "archive", norm_key(r.root), norm_key(r.path)))
 
+    qs = f"&q={quote(q)}" if q else ""
     nav = "".join(
-        f"<a href='/?f={k}&w={view}' class='{'on' if k == flt else ''}'>{k}"
-        f" <span style='opacity:.6'>{sum(1 for r in rt.repos if fn(r))}</span></a>"
+        f"<a href='/?f={k}&w={view}{qs}' class='{'on' if k == flt else ''}'>{k}"
+        f" <span style='opacity:.6'>"
+        f"{sum(1 for r in rt.repos if fn(r) and matches(r, q))}</span></a>"
         for k, fn in FILTERS.items())
     switch = "".join(
-        f"<a href='/?f={flt}&w={v}' class='{'on' if v == view else ''}'>{v}</a>"
+        f"<a href='/?f={flt}&w={v}{qs}' class='{'on' if v == view else ''}'>{v}</a>"
         for v in VIEWS)
+    search = (f"<form method=get action=/ class=srch>"
+              f"<input type=hidden name=f value='{esc(flt)}'>"
+              f"<input type=hidden name=w value='{esc(view)}'>"
+              f"<input type=search name=q value='{esc(q)}' autofocus "
+              f"placeholder='szukaj: nazwa, sciezka, pendrive, publiczne…'>"
+              + (f"<a href='/?f={flt}&w={view}' class=clr>wyczysc</a>" if q else "")
+              + "</form>")
 
     body = {"kafelki": as_tiles, "grupy": as_groups}.get(view, as_table)(repos, rt.token)
 
@@ -1187,7 +1245,8 @@ def render_page(rt: Runtime, flt: str, view: str = "lista") -> bytes:
             f"<form method=post action=/akcja>"
             f"<input type=hidden name=t value='{esc(rt.token)}'>"
             f"<input type=hidden name=a value='rescan'>"
-            f"<button class=d>przeskanuj dysk</button></form>")
+            f"<button class=d>przeskanuj dysk</button></form>"
+            f"<a href='/ustawienia' class=gl style='padding:5px 10px'>ustawienia</a>")
 
     return page("gitdesk", f"""
 <header><h1>gitdesk</h1>
@@ -1196,11 +1255,140 @@ def render_page(rt: Runtime, flt: str, view: str = "lista") -> bytes:
 {tw} grup blizniakow</span>
 <span style='margin-left:auto'>{bulk}</span></header>
 <nav>{nav}<span style='margin-left:auto;display:flex;gap:6px'>{switch}</span></nav>
+<div class=sbar>{search}<span class=cnt>{len(repos)} z {len(rt.repos)}</span></div>
 <main>{flash}{body}
 <p class=hint>Werdykt „zgodne" wymaga fetcha mlodszego niz doba — inaczej
 „niezweryfikowane". Pull zawsze --ff-only. Push zablokowany, gdy repo jest
 publiczne, a skan znajduje sekret.</p>
 </main>""")
+
+
+def render_settings(rt: Runtime) -> bytes:
+    conf = rt.conf
+    back = f"<a href='/?f={rt.filter}&w={rt.view}'>← wroc do listy</a>"
+    tok = f"<input type=hidden name=t value='{esc(rt.token)}'>"
+
+    roots = "\n".join(
+        f"{r['path']} | {r.get('mode', 'rw')} | {r.get('medium', '')}"
+        for r in conf.get("roots", []))
+    deps = "\n".join(
+        f"{d.get('name', '')} | {d['path']} | {d['source']}"
+        for d in conf.get("deployments", []))
+
+    # etykiety per repo - to samo, co przycisk "lokalne z wyboru", ale hurtem
+    labels = {norm_key(k): v for k, v in conf.get("labels", {}).items()}
+    rows = "".join(
+        f"<tr><td><div class=nm>{esc(r.name)}</div>"
+        f"<div class=pth>{esc(r.path)}</div></td><td>"
+        + "".join(
+            f"<label class=rad><input type=radio "
+            f"name='lab::{esc(r.path)}' value='{v}'"
+            f"{' checked' if labels.get(norm_key(r.path), '') == v else ''}>"
+            f"{txt}</label>"
+            for v, txt in (("", "zwykle"), (LOCAL_ONLY, "lokalne z wyboru"),
+                           (FOREIGN, "obce")))
+        + "</td></tr>"
+        for r in sorted(rt.repos, key=lambda x: norm_key(x.path))
+        if r.mode == "rw")
+
+    return page("gitdesk — ustawienia", f"""
+<header><h1>ustawienia</h1>
+<span class=sum>{esc(str(CONFIG_PATH))}</span>
+<span style='margin-left:auto'>{back}</span></header>
+<main>
+<form method=post action=/ustawienia>{tok}
+  <div class=sec><h2>Korzenie</h2>
+  <p class=hint>Jeden na linie: <code>sciezka | tryb | nosnik</code>.
+  Tryb <code>rw</code> albo <code>archive</code> — archiwalny odrzuca kazda akcje
+  zapisujaca. Nosnik pusty = wykryty z systemu (napede wymienny to „pendrive").</p>
+  <textarea name=roots rows=6>{esc(roots)}</textarea></div>
+
+  <div class=sec><h2>Wdrozenia</h2>
+  <p class=hint>Kopie bez <code>.git</code>. Jedna na linie:
+  <code>nazwa | sciezka kopii | repo zrodlowe</code>. Puste pole = brak.</p>
+  <textarea name=deployments rows=3>{esc(deps)}</textarea></div>
+
+  <div class=sec><h2>Konto i port</h2>
+  <p class=hint>Wlasciciel sluzy do jednego zapytania <code>gh repo list</code>,
+  ktore daje widocznosc wszystkich repo naraz.</p>
+  <label>wlasciciel na GitHubie
+    <input type=text name=owner value='{esc(conf.get("owner", ""))}'></label>
+  <label>port panelu
+    <input type=text name=port value='{esc(conf.get("port", 7420))}'></label>
+  <p class=hint>Zmiana portu zadziala po restarcie panelu.</p></div>
+
+  <div class=sec><h2>Etykiety repozytoriow</h2>
+  <p class=hint><b>lokalne z wyboru</b> — celowo bez zdalnego, przestaje byc
+  zglaszane jako usterka. <b>obce</b> — nie Twoj kod, zero akcji zapisujacych.</p>
+  <table>{rows}</table></div>
+
+  <p><button>zapisz</button></p>
+</form>
+</main>""")
+
+
+def parse_settings(form: dict, conf: dict) -> str:
+    """Zwraca komunikat. Zapis jest calosciowy - albo config sie sklada, albo nie."""
+    roots = []
+    for line in (form.get("roots") or [""])[0].splitlines():
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        path = parts[0]
+        if not path:
+            continue
+        mode = parts[1] if len(parts) > 1 and parts[1] in ("rw", "archive") else "rw"
+        medium = parts[2] if len(parts) > 2 and parts[2] else guess_medium(path, mode)
+        roots.append({"path": path, "mode": mode, "medium": medium})
+    if not roots:
+        return "Nie zapisano: musi zostac przynajmniej jeden korzen."
+
+    deps = []
+    for line in (form.get("deployments") or [""])[0].splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 3 and parts[1] and parts[2]:
+            deps.append({"name": parts[0] or Path(parts[1]).name,
+                         "path": parts[1], "source": parts[2]})
+
+    try:
+        port = int((form.get("port") or ["7420"])[0])
+        if not (1024 <= port <= 65535):
+            raise ValueError
+    except ValueError:
+        return "Nie zapisano: port musi byc liczba z zakresu 1024-65535."
+
+    labels = {}
+    for key, vals in form.items():
+        if key.startswith("lab::") and vals and vals[0]:
+            labels[key[5:]] = vals[0]
+
+    conf["roots"] = roots
+    conf["deployments"] = deps
+    conf["owner"] = (form.get("owner") or [""])[0].strip()
+    conf["port"] = port
+    conf["labels"] = labels
+    config_save(conf)
+    missing = [r["path"] for r in roots if not Path(r["path"]).is_dir()]
+    note = f"Zapisane. {len(roots)} korzeni, {len(labels)} etykiet."
+    if missing:
+        note += "  UWAGA, te sciezki nie istnieja: " + ", ".join(missing)
+    return note
+
+
+SETTINGS_CSS = """
+.sec{background:#131318;border:1px solid #22222a;border-radius:4px;
+ padding:14px 16px;margin-bottom:16px}
+.sec h2{margin:0 0 4px;font-size:12px;letter-spacing:.1em;text-transform:uppercase;
+ color:#f0b45e}
+.sec textarea{width:100%;background:#0d0d10;border:1px solid #2a2a34;border-radius:2px;
+ color:#d8d8dd;padding:9px 11px;font:12px ui-monospace,monospace;resize:vertical}
+.sec textarea:focus,.sec input:focus{outline:0;border-color:#f0b45e}
+.sec label{display:block;margin:9px 0;color:#9a9aa6;font-size:12px}
+.sec label input[type=text]{display:block;margin-top:4px;width:320px}
+.rad{display:inline-flex;align-items:center;gap:4px;margin-right:14px;
+ color:#9a9aa6;font-size:12px}
+.rad input{accent-color:#f0b45e}
+"""
 
 
 def render_graph(rt: Runtime, path: str, other: str, limit: int) -> bytes:
@@ -1267,8 +1455,11 @@ class Handler(BaseHTTPRequestHandler):
             view = q.get("w", ["lista"])[0]
             if view not in VIEWS:
                 view = "lista"
-            self.rt.view, self.rt.filter = view, flt
-            return self._send(render_page(self.rt, flt, view))
+            q = (q.get("q") or [""])[0][:120]
+            self.rt.view, self.rt.filter, self.rt.q = view, flt, q
+            return self._send(render_page(self.rt, flt, view, q))
+        if u.path == "/ustawienia":
+            return self._send(render_settings(self.rt))
         if u.path == "/graf":
             q = parse_qs(u.query)
             return self._send(render_graph(self.rt, (q.get("p") or [""])[0],
@@ -1282,7 +1473,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(page("404", "<main><p>Nie ma takiej strony.</p></main>"), code=404)
 
     def do_POST(self):
-        if urlparse(self.path).path != "/akcja":
+        where = urlparse(self.path).path
+        if where not in ("/akcja", "/ustawienia"):
             return self._send(page("404", "<main>404</main>"), code=404)
         try:
             n = int(self.headers.get("Content-Length") or 0)
@@ -1295,6 +1487,13 @@ class Handler(BaseHTTPRequestHandler):
         # moglaby wyslac POST-a i wysterowac panel.
         if not _secrets.compare_digest(token, self.rt.token):
             self.rt.flash = ("err", "zly token sesji - odswiez strone")
+            return self._redirect()
+
+        if where == "/ustawienia":
+            note = parse_settings(form, self.rt.conf)
+            self.rt.flash = ("err" if note.startswith("Nie zapisano") else "done", note)
+            self.rt.repos = scan(self.rt.conf, do_fetch=False,
+                                 do_vis=bool(self.rt.conf.get("owner")))
             return self._redirect()
 
         action = (form.get("a") or [""])[0]
@@ -1323,7 +1522,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _redirect(self):
         self.send_response(303)
-        self.send_header("Location", f"/?f={self.rt.filter}&w={self.rt.view}")
+        qs = f"&q={quote(self.rt.q)}" if self.rt.q else ""
+        self.send_header("Location",
+                         f"/?f={self.rt.filter}&w={self.rt.view}{qs}")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
