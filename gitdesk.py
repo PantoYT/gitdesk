@@ -70,6 +70,7 @@ CONFIG_DEFAULT = {
     "doctor": "../workspace-doctor/doctor.py",
     "owner": "PantoYT",
     "port": 7420,
+    "refresh": 0,        # sekundy; 0 = bez auto-odswiezania
     "max_depth": 6,
     # Kopie bez .git - dziala, ale zaden klient gita ich nie widzi, wiec cicho
     # sie starzeja. Tu dostaja kolumne "ile plikow rozjechalo sie ze zrodlem".
@@ -953,6 +954,8 @@ a.gl:hover{border-color:#f0b45e}
 .srch input[type=search]:focus{outline:0;border-color:#f0b45e}
 .srch .clr{font-size:11px;color:#6a6a76}
 .cnt{color:#5a5a66;font-size:11px;white-space:nowrap}
+a.so{color:#6a6a76;padding:2px 7px;border:1px solid #22222a;border-radius:2px;margin-left:4px}
+a.so.on{color:#0d0d10;background:#f0b45e;border-color:#f0b45e;font-weight:600}
 
 /* widok kafelkowy */
 .grid{display:grid;gap:12px;
@@ -984,6 +987,37 @@ a.gl:hover{border-color:#f0b45e}
 
 VIEWS = ("lista", "kafelki", "grupy")
 
+# Skroty i auto-odswiezanie. Przeladowanie jest wstrzymywane, gdy cokolwiek jest
+# zaznaczone albo kursor siedzi w polu - inaczej panel kasowalby wpisywany
+# tekst albo opis commita w polowie zdania.
+PANEL_JS = """<script>
+(function(){
+ var q=document.getElementById('q');
+ function typing(){var a=document.activeElement;
+  return a&&/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName);}
+ function go(u){location.href=u;}
+ function post(a){var f=document.createElement('form');f.method='post';
+  f.action='/akcja';f.innerHTML="<input name=t value='"+TOK+"'>"+
+  "<input name=a value='"+a+"'>";document.body.appendChild(f);f.submit();}
+ document.addEventListener('keydown',function(e){
+  if(e.ctrlKey||e.altKey||e.metaKey)return;
+  if(e.key==='Escape'&&q){q.value='';q.form.submit();return;}
+  if(typing())return;
+  var p=new URLSearchParams(location.search);
+  if(e.key==='/'){e.preventDefault();if(q){q.focus();q.select();}}
+  else if(e.key==='r'){e.preventDefault();post('rescan');}
+  else if(e.key==='f'){e.preventDefault();post('fetch_all');}
+  else if(e.key==='1'||e.key==='2'||e.key==='3'){
+   p.set('w',['lista','kafelki','grupy'][+e.key-1]);go('/?'+p);}
+ });
+ if(REFRESH>0)setInterval(function(){
+  if(typing())return;
+  if(window.getSelection&&String(window.getSelection()))return;
+  location.reload();
+ },REFRESH*1000);
+})();
+</script>"""
+
 
 class Runtime:
     def __init__(self, conf, doctor, repos):
@@ -996,6 +1030,7 @@ class Runtime:
         self.view = "lista"
         self.filter = "wszystko"
         self.q = ""
+        self.sort = "nazwa"
 
 
 def esc(s) -> str:
@@ -1006,7 +1041,7 @@ def page(title: str, body: str) -> bytes:
     return (f"<!doctype html><html lang=pl><head><meta charset=utf-8>"
             f"<meta name=viewport content='width=device-width,initial-scale=1'>"
             f"<title>{esc(title)}</title>"
-            f"<style>{PAGE_CSS}{GRAPH_CSS}{SETTINGS_CSS}</style></head>"
+            f"<style>{PAGE_CSS}{GRAPH_CSS}{SETTINGS_CSS}{DETAIL_CSS}</style></head>"
             f"<body>{body}</body></html>").encode("utf-8")
 
 
@@ -1086,6 +1121,7 @@ def buttons_for(r: Repo, token: str) -> str:
                       extra="<input type=text name=m placeholder='opis commita' required>"))
     if not r.remote and not r.label:
         b.append(form("mark_local", "to jest lokalne z wyboru", dim=True))
+    b.append(f"<a href='/repo?p={quote(r.path)}' class=gl>szczegoly</a>")
     b.append(f"<a href='/graf?p={quote(r.path)}' class=gl>graf</a>")
     if r.twin_of and r.mode == "rw":
         live = [t for t in r.twin_of if norm_key(t) != norm_key(r.path)]
@@ -1202,12 +1238,40 @@ def matches(r: Repo, q: str) -> bool:
     return all(word in hay for word in q.lower().split())
 
 
-def render_page(rt: Runtime, flt: str, view: str = "lista", q: str = "") -> bytes:
+def pilnosc(r: Repo) -> int:
+    """Im wyzej, tym bardziej cos czeka na reakcje."""
+    if r.mode == "archive" or r.label == FOREIGN:
+        return 0
+    s = 0
+    if r.ahead:
+        s += 40
+    if "ROZJAZD" in r.verdict:
+        s += 35
+    if not r.remote and not r.label:
+        s += 30
+    if r.dirty:
+        s += 20 if r.label != LOCAL_ONLY else 8
+    if r.behind:
+        s += 12
+    if stale(r):
+        s += 4
+    return s
+
+
+SORTS = {
+    "nazwa": lambda r: (r.mode == "archive", norm_key(r.root), norm_key(r.path)),
+    "ostatni-commit": lambda r: (r.mode == "archive", -r.last_commit),
+    "pilnosc": lambda r: (r.mode == "archive", -pilnosc(r), norm_key(r.name)),
+}
+
+
+def render_page(rt: Runtime, flt: str, view: str = "lista", q: str = "",
+                sort: str = "nazwa") -> bytes:
     repos = [r for r in rt.repos
              if FILTERS.get(flt, FILTERS["wszystko"])(r) and matches(r, q)]
-    repos.sort(key=lambda r: (r.mode == "archive", norm_key(r.root), norm_key(r.path)))
+    repos.sort(key=SORTS.get(sort, SORTS["nazwa"]))
 
-    qs = f"&q={quote(q)}" if q else ""
+    qs = (f"&q={quote(q)}" if q else "") + (f"&s={sort}" if sort != "nazwa" else "")
     nav = "".join(
         f"<a href='/?f={k}&w={view}{qs}' class='{'on' if k == flt else ''}'>{k}"
         f" <span style='opacity:.6'>"
@@ -1219,10 +1283,17 @@ def render_page(rt: Runtime, flt: str, view: str = "lista", q: str = "") -> byte
     search = (f"<form method=get action=/ class=srch>"
               f"<input type=hidden name=f value='{esc(flt)}'>"
               f"<input type=hidden name=w value='{esc(view)}'>"
-              f"<input type=search name=q value='{esc(q)}' autofocus "
-              f"placeholder='szukaj: nazwa, sciezka, pendrive, publiczne…'>"
-              + (f"<a href='/?f={flt}&w={view}' class=clr>wyczysc</a>" if q else "")
+              f"<input type=hidden name=s value='{esc(sort)}'>"
+              f"<input type=search name=q id=q value='{esc(q)}' autofocus "
+              f"placeholder='szukaj: nazwa, sciezka, pendrive, publiczne…  "
+              f"(klawisz /)'>"
+              + (f"<a href='/?f={flt}&w={view}&s={sort}' class=clr>wyczysc</a>"
+                 if q else "")
               + "</form>")
+    sorter = "".join(
+        f"<a href='/?f={flt}&w={view}&s={k}"
+        f"{'&q=' + quote(q) if q else ''}' class='so {'on' if k == sort else ''}'>"
+        f"{k.replace('-', ' ')}</a>" for k in SORTS)
 
     body = {"kafelki": as_tiles, "grupy": as_groups}.get(view, as_table)(repos, rt.token)
 
@@ -1255,12 +1326,148 @@ def render_page(rt: Runtime, flt: str, view: str = "lista", q: str = "") -> byte
 {tw} grup blizniakow</span>
 <span style='margin-left:auto'>{bulk}</span></header>
 <nav>{nav}<span style='margin-left:auto;display:flex;gap:6px'>{switch}</span></nav>
-<div class=sbar>{search}<span class=cnt>{len(repos)} z {len(rt.repos)}</span></div>
+<div class=sbar>{search}<span class=cnt>sortuj: {sorter}</span>
+<span class=cnt>{len(repos)} z {len(rt.repos)}</span></div>
 <main>{flash}{body}
-<p class=hint>Werdykt „zgodne" wymaga fetcha mlodszego niz doba — inaczej
-„niezweryfikowane". Pull zawsze --ff-only. Push zablokowany, gdy repo jest
-publiczne, a skan znajduje sekret.</p>
+<p class=hint>Klawisze: <b>/</b> szukaj · <b>r</b> przeskanuj · <b>f</b> odswiez
+zdalne · <b>1–3</b> widok · <b>Esc</b> wyczysc szukanie.
+Werdykt „zgodne" wymaga fetcha mlodszego niz doba. Pull zawsze --ff-only.
+Push zablokowany, gdy repo jest publiczne, a skan znajduje sekret.</p>
+</main>
+<script>var TOK={json.dumps(rt.token)},REFRESH={int(rt.conf.get("refresh", 0))};</script>
+{PANEL_JS}""")
+
+
+MAX_VIEW_BYTES = 400 * 1024
+
+
+def _diff_html(raw: str) -> str:
+    out = []
+    for line in raw.splitlines():
+        cls = ("dh" if line.startswith(("diff ", "index ", "--- ", "+++ ", "@@"))
+               else "dp" if line.startswith("+")
+               else "dm" if line.startswith("-") else "")
+        out.append(f"<div class='dl {cls}'>{esc(line) or '&nbsp;'}</div>")
+    return f"<div class=code>{''.join(out)}</div>" if out else ""
+
+
+def render_repo(rt: Runtime, path: str, want_file: str, want_diff: str) -> bytes:
+    r = next((x for x in rt.repos if x.path == path), None)
+    if r is None:
+        return page("repo", "<main><p>Nie znam takiego repo.</p>"
+                            "<p><a href='/'>wroc</a></p></main>")
+
+    qp = quote(r.path)
+    head = (f"<header><h1>{esc(r.name)}</h1>"
+            f"<span class=sum>{esc(r.medium or '?')} · {esc(r.branch)}"
+            f"{' · ' + esc(r.visibility.lower()) if r.visibility else ''}</span>"
+            f"<span style='margin-left:auto'>"
+            f"<a href='/graf?p={qp}' class=gl>graf</a>"
+            f"<a href='/?f={rt.filter}&w={rt.view}'>← lista</a></span></header>")
+
+    # ── podglad pojedynczego pliku albo jego roznicy ──────────────────────
+    if want_file or want_diff:
+        rel = want_file or want_diff
+        if want_diff:
+            raw = _run(r.path, "diff", "--", rel) or ""
+            if not raw.strip():
+                raw = _run(r.path, "diff", "--cached", "--", rel) or ""
+            body = _diff_html(raw) or "<p class=pth>Brak roznicy do pokazania.</p>"
+        else:
+            raw = _run(r.path, "show", f"HEAD:{rel}")
+            if raw is None:
+                body = "<p class=pth>Nie moge odczytac tego pliku z HEAD.</p>"
+            elif len(raw) > MAX_VIEW_BYTES:
+                body = (f"<p class=pth>Plik ma {human_kb(len(raw))} — za duzy na "
+                        f"podglad w panelu.</p>")
+            else:
+                lines = raw.splitlines() or [""]
+                body = ("<div class=code>" + "".join(
+                    f"<div class=dl><span class=ln>{i}</span>{esc(l) or '&nbsp;'}</div>"
+                    for i, l in enumerate(lines, 1)) + "</div>")
+        return page(f"{r.name} — {rel}", head + f"""<main>
+<p class=hint><a href='/repo?p={qp}'>← {esc(r.name)}</a> / <code>{esc(rel)}</code>
+{" · <a href='/repo?p=" + qp + "&file=" + quote(rel) + "'>pokaz tresc</a>" if want_diff else ""}
+{" · <a href='/repo?p=" + qp + "&diff=" + quote(rel) + "'>pokaz roznice</a>" if want_file and any(l[3:].strip().strip(chr(34)) == rel for l in (_run(r.path, "status", "--porcelain") or "").splitlines()) else ""}</p>
+{body}</main>""")
+
+    # ── ekran glowny repo ─────────────────────────────────────────────────
+    dirty_raw = (_run(r.path, "status", "--porcelain") or "").splitlines()
+    dirty = ""
+    if dirty_raw:
+        rows = []
+        for line in dirty_raw[:60]:
+            code, rel = line[:2].strip(), line[3:].strip().strip('"')
+            what = {"M": "zmieniony", "D": "usuniety", "A": "dodany",
+                    "R": "przeniesiony", "??": "nowy"}.get(code, code)
+            link = (f"<a href='/repo?p={qp}&diff={quote(rel)}'>roznica</a>"
+                    if code != "??" else
+                    f"<a href='/repo?p={qp}&file={quote(rel)}'>—</a>"
+                    if False else "<span class=pth>nowy plik</span>")
+            rows.append(f"<tr><td class=pth style='width:110px'>{esc(what)}</td>"
+                        f"<td><code>{esc(rel)}</code></td><td>{link}</td></tr>")
+        more = (f"<p class=hint>… i jeszcze {len(dirty_raw) - 60}</p>"
+                if len(dirty_raw) > 60 else "")
+        dirty = (f"<div class=sec><h2>Niezacommitowane ({len(dirty_raw)})</h2>"
+                 f"<table>{''.join(rows)}</table>{more}</div>")
+
+    br = _run(r.path, "branch", "-vv") or ""
+    branches = "".join(
+        f"<div class=dl>{'<b>' if l.startswith('*') else ''}{esc(l)}"
+        f"{'</b>' if l.startswith('*') else ''}</div>" for l in br.splitlines())
+
+    log = _run(r.path, "log", "-20", "--format=%h\x1f%ct\x1f%an\x1f%s") or ""
+    commits = []
+    for line in log.splitlines():
+        f = line.split("\x1f")
+        if len(f) < 4:
+            continue
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(f[1]))) if f[1].isdigit() else ""
+        commits.append(f"<tr><td><code>{esc(f[0])}</code></td>"
+                       f"<td>{esc(f[3])}</td>"
+                       f"<td class=pth style='white-space:nowrap'>{esc(when)} · {esc(f[2])}</td></tr>")
+
+    tree = (_run(r.path, "ls-tree", "-r", "--name-only", "HEAD") or "").splitlines()
+    files = "".join(
+        f"<div class=fl><a href='/repo?p={qp}&file={quote(t)}'>{esc(t)}</a></div>"
+        for t in tree[:400])
+    tree_more = (f"<p class=hint>pokazane 400 z {len(tree)}</p>"
+                 if len(tree) > 400 else "")
+
+    return page(f"gitdesk — {r.name}", head + f"""<main>
+<div class=sec><h2>Stan</h2><p>{tags_for(r)}</p>
+<p>{buttons_for(r, rt.token)}</p>
+<p class=pth>{esc(r.path)}{'  →  ' + esc(r.remote) if r.remote else ''}</p></div>
+{dirty}
+<div class=two>
+  <div class=sec><h2>Ostatnie commity</h2><table>{''.join(commits)}</table></div>
+  <div class=sec><h2>Galezie</h2><div class=code>{branches}</div></div>
+</div>
+<div class=sec><h2>Pliki w HEAD ({len(tree)})</h2>
+<div class=tree>{files}</div>{tree_more}</div>
 </main>""")
+
+
+def human_kb(n: int) -> str:
+    return f"{n / 1024:.0f} kB" if n < 1024 * 1024 else f"{n / 1048576:.1f} MB"
+
+
+DETAIL_CSS = """
+.code{background:#0d0d10;border:1px solid #22222a;border-radius:2px;padding:8px 0;
+ overflow-x:auto;font:12px/1.55 ui-monospace,monospace}
+.dl{padding:0 12px;white-space:pre}
+.dl .ln{display:inline-block;width:44px;color:#3a3a46;text-align:right;
+ margin-right:14px;user-select:none}
+.dh{color:#7fb8d9}
+.dp{color:#a5e0b5;background:#132018}
+.dm{color:#ffb4b4;background:#201316}
+.two{display:grid;gap:16px;grid-template-columns:1fr 1fr}
+@media(max-width:900px){.two{grid-template-columns:1fr}}
+.tree{max-height:340px;overflow:auto;font:12px ui-monospace,monospace}
+.fl{padding:2px 0}
+.fl a{color:#9a9aa6}
+.fl a:hover{color:#f0b45e}
+"""
 
 
 def render_settings(rt: Runtime) -> bytes:
@@ -1315,7 +1522,11 @@ def render_settings(rt: Runtime) -> bytes:
     <input type=text name=owner value='{esc(conf.get("owner", ""))}'></label>
   <label>port panelu
     <input type=text name=port value='{esc(conf.get("port", 7420))}'></label>
-  <p class=hint>Zmiana portu zadziala po restarcie panelu.</p></div>
+  <label>auto-odswiezanie co ile sekund (0 = wylaczone)
+    <input type=text name=refresh value='{esc(conf.get("refresh", 0))}'></label>
+  <p class=hint>Przeladowanie jest wstrzymywane, gdy piszesz w polu albo masz
+  cos zaznaczone — inaczej kasowaloby opis commita w polowie zdania.
+  Zmiana portu zadziala po restarcie panelu.</p></div>
 
   <div class=sec><h2>Etykiety repozytoriow</h2>
   <p class=hint><b>lokalne z wyboru</b> — celowo bez zdalnego, przestaje byc
@@ -1357,6 +1568,13 @@ def parse_settings(form: dict, conf: dict) -> str:
     except ValueError:
         return "Nie zapisano: port musi byc liczba z zakresu 1024-65535."
 
+    try:
+        refresh = int((form.get("refresh") or ["0"])[0] or 0)
+        if refresh and not (5 <= refresh <= 3600):
+            raise ValueError
+    except ValueError:
+        return "Nie zapisano: odswiezanie musi byc 0 albo 5-3600 sekund."
+
     labels = {}
     for key, vals in form.items():
         if key.startswith("lab::") and vals and vals[0]:
@@ -1366,6 +1584,7 @@ def parse_settings(form: dict, conf: dict) -> str:
     conf["deployments"] = deps
     conf["owner"] = (form.get("owner") or [""])[0].strip()
     conf["port"] = port
+    conf["refresh"] = refresh
     conf["labels"] = labels
     config_save(conf)
     missing = [r["path"] for r in roots if not Path(r["path"]).is_dir()]
@@ -1455,9 +1674,18 @@ class Handler(BaseHTTPRequestHandler):
             view = q.get("w", ["lista"])[0]
             if view not in VIEWS:
                 view = "lista"
+            sort = (q.get("s") or ["nazwa"])[0]
+            if sort not in SORTS:
+                sort = "nazwa"
             q = (q.get("q") or [""])[0][:120]
             self.rt.view, self.rt.filter, self.rt.q = view, flt, q
-            return self._send(render_page(self.rt, flt, view, q))
+            self.rt.sort = sort
+            return self._send(render_page(self.rt, flt, view, q, sort))
+        if u.path == "/repo":
+            q = parse_qs(u.query)
+            return self._send(render_repo(self.rt, (q.get("p") or [""])[0],
+                                          (q.get("file") or [""])[0],
+                                          (q.get("diff") or [""])[0]))
         if u.path == "/ustawienia":
             return self._send(render_settings(self.rt))
         if u.path == "/graf":
@@ -1522,7 +1750,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _redirect(self):
         self.send_response(303)
-        qs = f"&q={quote(self.rt.q)}" if self.rt.q else ""
+        qs = (f"&q={quote(self.rt.q)}" if self.rt.q else "")
+        qs += f"&s={self.rt.sort}" if self.rt.sort != "nazwa" else ""
         self.send_header("Location",
                          f"/?f={self.rt.filter}&w={self.rt.view}{qs}")
         self.send_header("Content-Length", "0")
