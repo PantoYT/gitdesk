@@ -1760,6 +1760,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def handle_one_request(self):
+        # Przegladarka anulujaca zadanie (przelaczenie strony, auto-odswiezanie)
+        # zrywa polaczenie w trakcie zapisu. To normalne zdarzenie, nie blad -
+        # bez tego kazde takie klikniecie sypie pelnym tracebackiem.
+        try:
+            super().handle_one_request()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
+
 
 def already_running(port: int) -> bool:
     """Czy pod tym portem siedzi juz gitdesk.
