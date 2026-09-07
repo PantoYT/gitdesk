@@ -803,6 +803,18 @@ def render_twins(repos: list[Repo]) -> None:
 # --------------------------------------------------------------------------
 
 
+def secret_name_is_template(rel: str) -> bool:
+    """Szablony konfiguracji nie sa sekretami tylko dlatego, ze maja np.
+    nazwe `.env.local.example`. Ich TRESC nadal jest skanowana ponizej."""
+    name = Path(rel).name.lower()
+    return (name.endswith((".example", ".sample", ".template")) or
+            name.startswith(("example.", "sample.", "template.")))
+
+
+def secret_name_is_unsafe(rel: str, doctor) -> bool:
+    return bool(doctor.SECRET_FILE_RE.search(rel)) and not secret_name_is_template(rel)
+
+
 def secret_crits(repo: str, doctor) -> list[str]:
     """Sekrety w JEDNYM repo. doctor.check_secrets() chodzi po calym korzeniu,
     a przed pushem interesuje nas dokladnie to repo i nic wiecej."""
@@ -811,13 +823,13 @@ def secret_crits(repo: str, doctor) -> list[str]:
     if listing is None:
         return out
     for rel in listing.splitlines():
-        if rel and doctor.SECRET_FILE_RE.search(rel):
+        if rel and secret_name_is_unsafe(rel, doctor):
             out.append(f"sekret w repo: {rel}")
     st = _run(repo, "status", "--porcelain", "--untracked-files=all") or ""
     for line in st.splitlines():
         if line.startswith("??"):
             rel = line[3:].strip().strip('"')
-            if doctor.SECRET_FILE_RE.search(rel):
+            if secret_name_is_unsafe(rel, doctor):
                 out.append(f"nieignorowany sekret: {rel}")
     return out
 
@@ -832,7 +844,7 @@ def staged_secrets(repo: str, doctor) -> list[str]:
     for rel in staged.splitlines():
         if not rel:
             continue
-        if doctor.SECRET_FILE_RE.search(rel):
+        if secret_name_is_unsafe(rel, doctor):
             bad.append(f"{rel} - nazwa wskazuje na plik z sekretem")
             continue
         try:
@@ -2354,6 +2366,19 @@ def selftest() -> int:
         check("indeks wyczyszczony po odrzuceniu",
               not (_run(str(src), "diff", "--cached", "--name-only") or "").strip())
         (src / ".env").unlink()
+
+        # Nazwa szablonu ma byc dozwolona, ale nie moze wylaczac skanu tresci.
+        template = src / ".env.local.example"
+        template.write_text("OPENAI_API_KEY=replace-me\n", encoding="utf-8")
+        rt.repos = probe_all(both, labels)
+        good, note = act(rt, "commit", str(src), "bezpieczny szablon konfiguracji")
+        check("plik .env.local.example nie jest sekretem z samej nazwy", good, note)
+        template.write_text(f"OPENAI_API_KEY={fake_token}\n", encoding="utf-8")
+        rt.repos = probe_all(both, labels)
+        good, note = act(rt, "commit", str(src), "sekret ukryty w szablonie")
+        check("realny sekret w szablonie nadal jest ODRZUCONY", not good, note)
+        check("skan tresci nazywa plik szablonu", ".env.local.example" in note, note)
+        template.write_text("OPENAI_API_KEY=replace-me\n", encoding="utf-8")
 
         # ── zwykly commit ma przejsc ──────────────────────────────────────
         (src / "c.txt").write_text("3", encoding="utf-8")
