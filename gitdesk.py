@@ -28,6 +28,7 @@ import secrets as _secrets
 import socket
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
@@ -46,6 +47,7 @@ HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
 STATE_DIR = HERE / "state"
 INDEX_PATH = STATE_DIR / "index.json"
+DEFAULT_WORKERS = min(16, max(4, (os.cpu_count() or 4) * 2))
 
 # --------------------------------------------------------------------------
 # konfiguracja
@@ -71,6 +73,7 @@ CONFIG_DEFAULT = {
     "owner": "PantoYT",
     "port": 7420,
     "refresh": 0,        # sekundy; 0 = bez auto-odswiezania
+    "workers": DEFAULT_WORKERS,
     "max_depth": 6,
     # Kopie bez .git - dziala, ale zaden klient gita ich nie widzi, wiec cicho
     # sie starzeja. Tu dostaja kolumne "ile plikow rozjechalo sie ze zrodlem".
@@ -382,7 +385,8 @@ def probe(entry: dict, labels: dict) -> Repo:
     return r
 
 
-def probe_all(entries: list[dict], labels: dict, workers: int = 8) -> list[Repo]:
+def probe_all(entries: list[dict], labels: dict,
+              workers: int = DEFAULT_WORKERS) -> list[Repo]:
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(lambda e: probe(e, labels), entries))
 
@@ -392,7 +396,8 @@ def probe_all(entries: list[dict], labels: dict, workers: int = 8) -> list[Repo]
 # --------------------------------------------------------------------------
 
 
-def fetch_all(repos: list[Repo], workers: int = 8) -> tuple[int, int]:
+def fetch_all(repos: list[Repo],
+              workers: int = DEFAULT_WORKERS) -> tuple[int, int]:
     """Bez tego ahead/behind klamie.
 
     'git status' liczy roznice wzgledem origin/... zapisanego lokalnie przy
@@ -518,8 +523,11 @@ def find_twins(repos: list[Repo]) -> dict[str, list[Repo]]:
                 m.verdict = f"z przodu o {m.ahead} — push, potem pull na: {where(others)}"
             elif newer:
                 m.verdict = f"z tylu — pull (nowsze na: {where(newer)})"
-            elif m.behind or any(o.behind for o in others):
-                m.verdict = "obie za zdalnym — pull"
+            elif m.behind:
+                m.verdict = f"ta kopia z tylu o {m.behind} — pull"
+            elif any(o.behind for o in others):
+                lagging = [o for o in others if o.behind]
+                m.verdict = f"aktualna; z tylu: {where(lagging)}"
             elif stale(m) or any(stale(o) for o in others):
                 # Nie "martwe" - tylko dawno nieodpytywane. Roznica jest istotna:
                 # te kopie bywaja zrodlem commitow, nie sa kopia zapasowa PC-ta.
@@ -638,10 +646,11 @@ def render_deployments(deps: list[Deployment]) -> None:
 def scan(conf: dict, do_fetch: bool = False, do_vis: bool = True) -> list[Repo]:
     entries = discover(conf)
     labels = {norm_key(k): v for k, v in conf.get("labels", {}).items()}
-    repos = probe_all(entries, labels)
+    workers = int(conf.get("workers", DEFAULT_WORKERS))
+    repos = probe_all(entries, labels, workers)
     if do_fetch:
-        fetch_all(repos)
-        repos = probe_all(entries, labels)      # ahead/behind po swiezym fetchu
+        fetch_all(repos, workers)
+        repos = probe_all(entries, labels, workers)  # ahead/behind po swiezym fetchu
     if do_vis:
         apply_visibility(repos, conf.get("owner", ""))
     find_twins(repos)
@@ -877,7 +886,7 @@ def act(rt, action: str, path: str, msg: str = "") -> tuple[bool, str]:
         out = _run(r.path, "push", timeout=180)
         return out is not None, "wypchniete" if out is not None else "push nie przeszedl"
 
-    if action == "commit":
+    if action in ("commit", "commit_push"):
         if not msg.strip():
             return False, "pusty opis commita"
         if _run(r.path, "add", "-A") is None:
@@ -887,7 +896,14 @@ def act(rt, action: str, path: str, msg: str = "") -> tuple[bool, str]:
             _run(r.path, "reset")
             return False, "COMMIT ODRZUCONY - sekret w indeksie: " + "; ".join(bad)
         out = _run(r.path, "commit", "-m", msg, timeout=60)
-        return out is not None, "zacommitowane" if out is not None else "commit nie przeszedl"
+        if out is None:
+            return False, "commit nie przeszedl"
+        if action == "commit_push" and r.remote:
+            pushed = _run(r.path, "push", timeout=180)
+            return (pushed is not None,
+                    "zacommitowane i wypchniete" if pushed is not None
+                    else "commit zapisany, ale push nie przeszedl")
+        return True, "zacommitowane"
 
     if action == "mark_local":
         rt.conf.setdefault("labels", {})[r.path] = LOCAL_ONLY
@@ -896,6 +912,97 @@ def act(rt, action: str, path: str, msg: str = "") -> tuple[bool, str]:
         return True, "oznaczone jako lokalne z wyboru"
 
     return False, f"nieznana akcja: {action}"
+
+
+def rescan_one(rt, path: str) -> None:
+    """Odswieza JEDNO repo po akcji na nim, zamiast pelnego scan().
+
+    scan() to discover() (chodzenie po dysku po wszystkich korzeniach, w tym
+    archiwum na HDD) plus probe() na KAZDYM repo - przy 81 repo to kilkaset
+    wywolan git.exe i 10-14s, mierzone na tej maszynie. Klikniecie "push" na
+    jednym repo nie zmienia stanu pozostalych 80, wiec starcza odpytac to
+    jedno i przeliczyc widocznosc/blizniakow na danych juz w pamieci - obie
+    funkcje nie licza gita, tylko porownuja pola juz wczytanych Repo.
+    """
+    labels = {norm_key(k): v for k, v in rt.conf.get("labels", {}).items()}
+    idx = next((i for i, x in enumerate(rt.repos) if x.path == path), None)
+    if idx is None:
+        return
+    old = rt.repos[idx]
+    entry = {"path": old.path, "root": old.root, "mode": old.mode, "medium": old.medium}
+    rt.repos[idx] = probe(entry, labels)
+    if rt.conf.get("owner"):
+        apply_visibility(rt.repos, rt.conf["owner"])
+    find_twins(rt.repos)
+    save_index(rt.repos)
+
+
+def refresh_known(rt) -> None:
+    """Rownolegle odpyta repo juz znalezione, bez ponownego chodzenia po dysku."""
+    entries = [{"path": r.path, "root": r.root, "mode": r.mode,
+                "medium": r.medium} for r in rt.repos]
+    labels = {norm_key(k): v for k, v in rt.conf.get("labels", {}).items()}
+    workers = int(rt.conf.get("workers", DEFAULT_WORKERS))
+    repos = probe_all(entries, labels, workers)
+    if rt.conf.get("owner"):
+        apply_visibility(repos, rt.conf["owner"])
+    find_twins(repos)
+    rt.repos = repos
+    save_index(repos)
+
+
+def act_many(rt, action: str, repos: list[Repo]) -> tuple[int, int, list[str]]:
+    """Wykonuje te sama akcje na repo rownolegle i zbiera czytelny raport."""
+    paths = [r.path for r in repos]
+    workers = int(rt.conf.get("workers", DEFAULT_WORKERS))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(lambda p: act(rt, action, p), paths))
+    ok = sum(1 for good, _ in results if good)
+    failed = [f"{Path(path).name}: {note}" for path, (good, note)
+              in zip(paths, results) if not good]
+    return ok, len(results) - ok, failed
+
+
+def sync_ready(rt) -> tuple[bool, str]:
+    """Bezpieczna synchronizacja bez wymyslania commitow za uzytkownika.
+
+    1. fetch wszystkich, 2. push gotowych commitow, 3. ponowny fetch po pushach,
+    4. pull --ff-only czystych kopii z tylu. Brudne repo zostaja do recznego
+    commita z sensownym opisem.
+    """
+    workers = int(rt.conf.get("workers", DEFAULT_WORKERS))
+    fetch_ok, fetch_fail = fetch_all(rt.repos, workers)
+    refresh_known(rt)
+
+    to_push = [r for r in rt.repos if r.ahead and r.writable]
+    push_ok, push_fail, push_errors = act_many(rt, "push", to_push)
+
+    # Push z pendrive'a zmienil remote dopiero PO pierwszym fetchu. Drugi fetch
+    # sprawia, ze kopia na PC od razu zobaczy, ze jest z tylu.
+    if push_ok:
+        f2_ok, f2_fail = fetch_all(rt.repos, workers)
+        fetch_ok += f2_ok
+        fetch_fail += f2_fail
+    refresh_known(rt)
+
+    dirty_behind = [r for r in rt.repos if r.behind and r.dirty
+                    and r.mode == "rw" and r.label != FOREIGN]
+    to_pull = [r for r in rt.repos if r.behind and not r.dirty
+               and r.mode == "rw" and r.label != FOREIGN]
+    pull_ok, pull_fail, pull_errors = act_many(rt, "pull", to_pull)
+    refresh_known(rt)
+
+    problems = push_errors + pull_errors
+    note = (f"fetch {fetch_ok} ok/{fetch_fail} bledow · "
+            f"push {push_ok} ok/{push_fail} bledow · "
+            f"pull {pull_ok} ok/{pull_fail} bledow")
+    if dirty_behind:
+        note += f" · pominieto {len(dirty_behind)} brudnych repo z tylu"
+    if problems:
+        note += " · " + "; ".join(problems[:3])
+        if len(problems) > 3:
+            note += f"; i jeszcze {len(problems) - 3}"
+    return not (fetch_fail or push_fail or pull_fail), note
 
 
 # --------------------------------------------------------------------------
@@ -935,11 +1042,16 @@ button{font:600 11px ui-monospace,monospace;color:#0d0d10;background:#8a8a99;
 button:hover{background:#f0b45e}
 button.d{background:#2a2a34;color:#9a9aa6}
 button.d:hover{background:#3a3a46;color:#d8d8dd}
+button:disabled{opacity:.45;cursor:wait}
 input[type=text]{background:#17171d;border:1px solid #2a2a34;color:#d8d8dd;
  padding:4px 7px;font:12px ui-monospace,monospace;border-radius:2px;width:230px}
 .bar{margin:0 0 16px;padding:11px 14px;background:#131318;border-left:2px solid #f0b45e}
 .err{border-left-color:#c0484e;color:#ffb4b4}
 .done{border-left-color:#4e9e63;color:#a5e0b5}
+.busy{position:relative;overflow:hidden;border-left-color:#7fb8d9;color:#b9dcec}
+.busy:after{content:"";position:absolute;left:0;bottom:0;width:34%;height:2px;
+ background:#7fb8d9;animation:job 1.1s ease-in-out infinite alternate}
+@keyframes job{from{transform:translateX(-30%)}to{transform:translateX(225%)}}
 .hint{color:#5a5a66;font-size:11px;margin-top:3px}
 a.gl{font-size:11px;padding:4px 8px;border:1px solid #2a2a34;border-radius:2px;
  margin-right:4px;display:inline-block}
@@ -1015,6 +1127,7 @@ PANEL_JS = """<script>
   if(window.getSelection&&String(window.getSelection()))return;
   location.reload();
  },REFRESH*1000);
+ if(BUSY)setTimeout(function(){if(!typing())location.reload();},900);
 })();
 </script>"""
 
@@ -1028,9 +1141,32 @@ class Runtime:
         self.flash: tuple[str, str] | None = None
         # zapamietane, zeby przekierowanie po akcji wracalo tam, gdzie bylo
         self.view = "lista"
-        self.filter = "wszystko"
+        self.filter = "do-zrobienia"
         self.q = ""
         self.sort = "nazwa"
+        self.busy = False
+        self.job_label = ""
+        self._job_lock = threading.Lock()
+
+    def start_job(self, label: str, work) -> bool:
+        """Uruchamia jedna operacje w tle, zeby przegladarka nie wisiala."""
+        if not self._job_lock.acquire(blocking=False):
+            return False
+        self.busy = True
+        self.job_label = label
+
+        def runner():
+            try:
+                good, note = work()
+            except Exception as e:
+                good, note = False, f"operacja przerwana: {e}"
+            self.flash = ("done" if good else "err", note)
+            self.busy = False
+            self.job_label = ""
+            self._job_lock.release()
+
+        threading.Thread(target=runner, name="gitdesk-job", daemon=True).start()
+        return True
 
 
 def esc(s) -> str:
@@ -1046,6 +1182,8 @@ def page(title: str, body: str) -> bytes:
 
 
 FILTERS = {
+    "do-zrobienia": lambda r: r.mode == "rw" and r.label != FOREIGN and bool(
+        r.error or r.dirty or r.ahead or r.behind or (not r.remote and not r.label)),
     "wszystko": lambda r: True,
     "brudne": lambda r: r.dirty > 0,
     "niewypchniete": lambda r: r.ahead > 0,
@@ -1117,7 +1255,8 @@ def buttons_for(r: Repo, token: str) -> str:
         if r.ahead and r.label != FOREIGN:
             b.append(form("push", f"push {r.ahead}"))
     if r.dirty and r.label != FOREIGN:
-        b.append(form("commit", "commit",
+        b.append(form("commit_push" if r.remote else "commit",
+                      "commit + push" if r.remote else "commit",
                       extra="<input type=text name=m placeholder='opis commita' required>"))
     if not r.remote and not r.label:
         b.append(form("mark_local", "to jest lokalne z wyboru", dim=True))
@@ -1265,7 +1404,7 @@ SORTS = {
 }
 
 
-def render_page(rt: Runtime, flt: str, view: str = "lista", q: str = "",
+def render_page(rt: Runtime, flt: str = "do-zrobienia", view: str = "lista", q: str = "",
                 sort: str = "nazwa") -> bytes:
     repos = [r for r in rt.repos
              if FILTERS.get(flt, FILTERS["wszystko"])(r) and matches(r, q)]
@@ -1307,17 +1446,23 @@ def render_page(rt: Runtime, flt: str, view: str = "lista", q: str = "",
     unp = sum(1 for r in rt.repos if r.ahead and r.mode == "rw")
     nor = sum(1 for r in rt.repos if not r.remote and not r.label and r.mode == "rw")
     tw = len(find_twins(rt.repos))
-    st = sum(1 for r in rt.repos if r.mode == "rw" and stale(r))
 
     bulk = (f"<form method=post action=/akcja>"
             f"<input type=hidden name=t value='{esc(rt.token)}'>"
+            f"<input type=hidden name=a value='sync_ready'>"
+            f"<button{' disabled' if rt.busy else ''}>synchronizuj bezpiecznie</button></form>"
+            f"<form method=post action=/akcja>"
+            f"<input type=hidden name=t value='{esc(rt.token)}'>"
             f"<input type=hidden name=a value='fetch_all'>"
-            f"<button>odswiez wszystkie ({st} nieswiezych)</button></form>"
+            f"<button class=d{' disabled' if rt.busy else ''}>fetch wszystkich</button></form>"
             f"<form method=post action=/akcja>"
             f"<input type=hidden name=t value='{esc(rt.token)}'>"
             f"<input type=hidden name=a value='rescan'>"
-            f"<button class=d>przeskanuj dysk</button></form>"
+            f"<button class=d{' disabled' if rt.busy else ''}>znajdz repo</button></form>"
             f"<a href='/ustawienia' class=gl style='padding:5px 10px'>ustawienia</a>")
+
+    running = (f"<p class='bar busy'>{esc(rt.job_label)} — panel pozostaje aktywny</p>"
+               if rt.busy else "")
 
     return page("gitdesk", f"""
 <header><h1>gitdesk</h1>
@@ -1328,13 +1473,13 @@ def render_page(rt: Runtime, flt: str, view: str = "lista", q: str = "",
 <nav>{nav}<span style='margin-left:auto;display:flex;gap:6px'>{switch}</span></nav>
 <div class=sbar>{search}<span class=cnt>sortuj: {sorter}</span>
 <span class=cnt>{len(repos)} z {len(rt.repos)}</span></div>
-<main>{flash}{body}
+<main>{running}{flash}{body}
 <p class=hint>Klawisze: <b>/</b> szukaj · <b>r</b> przeskanuj · <b>f</b> odswiez
 zdalne · <b>1–3</b> widok · <b>Esc</b> wyczysc szukanie.
 Werdykt „zgodne" wymaga fetcha mlodszego niz doba. Pull zawsze --ff-only.
 Push zablokowany, gdy repo jest publiczne, a skan znajduje sekret.</p>
 </main>
-<script>var TOK={json.dumps(rt.token)},REFRESH={int(rt.conf.get("refresh", 0))};</script>
+<script>var TOK={json.dumps(rt.token)},REFRESH={int(rt.conf.get("refresh", 0))},BUSY={str(rt.busy).lower()};</script>
 {PANEL_JS}""")
 
 
@@ -1670,7 +1815,7 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/":
             q = parse_qs(u.query)
-            flt = q.get("f", ["wszystko"])[0]
+            flt = q.get("f", ["do-zrobienia"])[0]
             view = q.get("w", ["lista"])[0]
             if view not in VIEWS:
                 view = "lista"
@@ -1718,6 +1863,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._redirect()
 
         if where == "/ustawienia":
+            if self.rt.busy:
+                self.rt.flash = ("err", "poczekaj, az biezaca operacja sie skonczy")
+                return self._redirect()
             note = parse_settings(form, self.rt.conf)
             self.rt.flash = ("err" if note.startswith("Nie zapisano") else "done", note)
             self.rt.repos = scan(self.rt.conf, do_fetch=False,
@@ -1729,23 +1877,40 @@ class Handler(BaseHTTPRequestHandler):
         msg = (form.get("m") or [""])[0]
 
         if action == "rescan":
-            self.rt.repos = scan(self.rt.conf, do_fetch=False,
-                                 do_vis=bool(self.rt.conf.get("owner")))
-            self.rt.flash = ("done", f"przeskanowane: {len(self.rt.repos)} repo")
+            def rescan_job():
+                self.rt.repos = scan(self.rt.conf, do_fetch=False,
+                                     do_vis=bool(self.rt.conf.get("owner")))
+                return True, f"znaleziono i odpytano {len(self.rt.repos)} repo"
+            if not self.rt.start_job("szukam repo i odczytuje ich stan", rescan_job):
+                self.rt.flash = ("err", "inna operacja jeszcze trwa")
             return self._redirect()
 
         if action == "fetch_all":
-            ok, fail = fetch_all(self.rt.repos)
-            self.rt.repos = scan(self.rt.conf, do_fetch=False, do_vis=False)
-            self.rt.flash = ("done" if not fail else "err",
-                             f"odswiezone: {ok} ok, {fail} nieudanych")
+            def fetch_job():
+                workers = int(self.rt.conf.get("workers", DEFAULT_WORKERS))
+                ok, fail = fetch_all(self.rt.repos, workers)
+                refresh_known(self.rt)
+                return not fail, f"fetch: {ok} ok, {fail} nieudanych"
+            if not self.rt.start_job("odpytuje zdalne repozytoria", fetch_job):
+                self.rt.flash = ("err", "inna operacja jeszcze trwa")
             return self._redirect()
 
-        good, note = act(self.rt, action, path, msg)
+        if action == "sync_ready":
+            if not self.rt.start_job(
+                    "fetch → push gotowych → fetch → pull czystych",
+                    lambda: sync_ready(self.rt)):
+                self.rt.flash = ("err", "inna operacja jeszcze trwa")
+            return self._redirect()
+
         name = Path(path).name if path else "?"
-        self.rt.flash = ("done" if good else "err", f"{name}: {note}")
-        # stan repo po akcji jest inny - przeliczamy, zeby tabela nie klamala
-        self.rt.repos = scan(self.rt.conf, do_fetch=False, do_vis=False)
+        def one_job():
+            good, note = act(self.rt, action, path, msg)
+            # Stan tego repo po akcji jest inny. Pelny scan wszystkich korzeni
+            # byl tu glownym powodem zawieszania panelu.
+            rescan_one(self.rt, path)
+            return good, f"{name}: {note}"
+        if not self.rt.start_job(f"{name}: {action}", one_job):
+            self.rt.flash = ("err", "inna operacja jeszcze trwa")
         self._redirect()
 
     def _redirect(self):
@@ -1848,7 +2013,7 @@ def tailnet_ip() -> str | None:
 
 
 def serve(conf: dict, doctor, repos: list[Repo], bind: str = "local",
-          open_browser: bool = True) -> int:
+          open_browser: bool = True, refresh_on_start: bool = False) -> int:
     # Domyslnie WYLACZNIE petla zwrotna. Ten panel wykonuje commit, reset, push
     # i pull na kilkudziesieciu repo, uzywajac poswiadczen, ktore maszyna juz ma
     # - nie ma tu tokenu do wykradzenia, bo zaden nie jest potrzebny. Kto dojdzie
@@ -1877,6 +2042,12 @@ def serve(conf: dict, doctor, repos: list[Repo], bind: str = "local",
         return 0
     port = free_port(want)
     Handler.rt = Runtime(conf, doctor, repos)
+    if refresh_on_start:
+        def initial_refresh():
+            Handler.rt.repos = scan(
+                conf, do_fetch=False, do_vis=bool(conf.get("owner")))
+            return True, f"stan {len(Handler.rt.repos)} repo jest aktualny"
+        Handler.rt.start_job("odswiezam stan repo w tle", initial_refresh)
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.daemon_threads = True
     url = f"http://{host}:{port}/"
@@ -2158,10 +2329,25 @@ def selftest() -> int:
               not (_run(str(src), "for-each-ref", "refs/gitdesk/") or "").strip(),
               "ref zostal w repo")
 
+        # ── jedna kopia po fetchu widzi nowy commit ze zdalnego ──────────
+        g(src, "push", "-q")
+        g(pen, "fetch", "-q")
+        repos = probe_all(both, labels)
+        find_twins(repos)
+        pc = next(r for r in repos if r.medium == "PC")
+        pd = next(r for r in repos if r.medium == "pendrive")
+        check("blizniak wskazuje dokladnie kopie wymagajaca pull",
+              "ta kopia z tylu o 1" in pd.verdict, pd.verdict)
+        check("aktualna kopia nazywa opozniony nosnik",
+              "aktualna; z tylu: pendrive" in pc.verdict, pc.verdict)
+
         # ── blokada commita z sekretem ────────────────────────────────────
         rt = Runtime(conf, doctor, repos)
-        (src / ".env").write_text("OPENAI_API_KEY=sk-QhTvN82wKpLmXr4dYbFj910AcEuZsRoI\n",
-                                  encoding="utf-8")
+        # Pelny testowy token powstaje dopiero w pamieci. Gdyby realistyczne
+        # `sk-...` lezalo doslownie w tym pliku, gitdesk slusznie blokowalby
+        # commit wlasnego repo, zanim selftest zdazylby cokolwiek sprawdzic.
+        fake_token = "sk-" + "QhTvN82wKpLmXr4dYbFj910AcEuZsRoI"
+        (src / ".env").write_text(f"OPENAI_API_KEY={fake_token}\n", encoding="utf-8")
         good, note = act(rt, "commit", str(src), "probuje przemycic sekret")
         check("commit z sekretem ODRZUCONY", not good, note)
         check("odrzucenie nazywa plik", ".env" in note, note)
@@ -2174,6 +2360,14 @@ def selftest() -> int:
         rt.repos = probe_all(both, labels)
         good, note = act(rt, "commit", str(src), "zwykla zmiana")
         check("commit bez sekretu przechodzi", good, note)
+
+        # ── skrocona akcja commit + push ─────────────────────────────────
+        (src / "d.txt").write_text("4", encoding="utf-8")
+        rt.repos = probe_all(both, labels)
+        good, note = act(rt, "commit_push", str(src), "zmiana od razu na remote")
+        after = probe({"path": str(src), "root": str(tmp), "mode": "rw",
+                       "medium": "PC"}, labels)
+        check("commit + push robi oba kroki", good and after.ahead == 0, note)
 
         # ── korzen archiwalny odrzuca zapisy ──────────────────────────────
         arch = [{"path": str(pen), "root": str(tmp), "mode": "archive",
@@ -2257,7 +2451,17 @@ def main() -> int:
     conf = config_load()
     doctor = load_doctor(conf)      # twardy blad, jesli brak - zanim cokolwiek zrobimy
 
-    if args.cached:
+    refresh_on_start = False
+    if args.cmd == "serve" and not args.fetch and not args.cached:
+        # Panel ma pojawic sie od razu. Ostatni indeks wystarcza na pierwszy
+        # ekran, a swiezy stan wszystkich repo doladuje sie rownolegle w tle.
+        repos = load_index()
+        if repos is None:
+            repos = scan(conf, do_fetch=False, do_vis=not args.no_gh)
+        else:
+            find_twins(repos)
+            refresh_on_start = True
+    elif args.cached:
         repos = load_index()
         if repos is None:
             print("Brak cache - skanuje od nowa.", file=sys.stderr)
@@ -2277,7 +2481,8 @@ def main() -> int:
         print(f"Znalazlem {len(repos)} repozytoriow, zapisalem {INDEX_PATH}")
     elif args.cmd == "serve":
         return serve(conf, doctor, repos, bind=args.bind,
-                     open_browser=not args.no_browser)
+                     open_browser=not args.no_browser,
+                     refresh_on_start=refresh_on_start)
     else:
         render_list(repos, conf)
         render_deployments(check_deployments(conf, doctor))

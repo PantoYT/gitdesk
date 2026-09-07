@@ -21,7 +21,19 @@ python gitdesk.py list --fetch    # najpierw odswiez remote'y - wolniej, ale pra
 python gitdesk.py twins           # tylko grupy blizniakow
 python gitdesk.py scan            # przeskanuj i zapisz cache
 python gitdesk.py list --json     # do skryptow
+python gitdesk.py serve           # panel; cache od razu, swiezy skan w tle
 ```
+
+Panel odpytuje repozytoria rownolegle (do 16 naraz), ale nie blokuje pierwszego
+ekranu. Domyslny filtr `do-zrobienia` pokazuje tylko repo brudne, do push, do
+pull albo wymagajace decyzji.
+
+`synchronizuj bezpiecznie` wykonuje kolejno: fetch wszystkich, push gotowych
+commitow, ponowny fetch i pull `--ff-only` czystych kopii bedacych z tylu.
+Brudnego repo nie commituje automatycznie — opis zmiany trzeba wpisac przy nim;
+przycisk `commit + push` robi wtedy oba kroki. Jesli brudna kopia jest jednoczesnie
+z tylu, najpierw trzeba polaczyc historie recznie, bo panel swiadomie nie rozstrzyga
+konfliktow.
 
 Pierwsze uruchomienie tworzy `config.json` z domyslnymi ustawieniami.
 
@@ -96,7 +108,7 @@ narzedzie o tym glosno mowi przy starcie.
 python gitdesk.py --selftest
 ```
 
-17 asercji na tymczasowych repo w `%TEMP%`. Sprawdza to, czego awaria bylaby
+20 asercji na tymczasowych repo w `%TEMP%`. Sprawdza to, czego awaria bylaby
 **cicha**: blokada commita z sekretem nie krzyczy, kiedy przestaje dzialac —
 po prostu przepuszcza.
 
