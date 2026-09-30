@@ -115,10 +115,11 @@ machine's global gitignore contains `.env` and the file never reached the index.
 
 None outside the standard library (Python 3.14).
 
-The secret scan isn't written again here: `gitdesk` loads
-[`workspace-doctor`](../workspace-doctor) as a module and uses its patterns and
-`looks_synthetic()`. **A missing doctor is a hard error at start**, not a silent skip — a
-tool that quietly switches off its failsafe is worse than no tool.
+The secret scan (file names that hold secrets, real key formats, and `looks_synthetic()`
+to let test fixtures through) is built in, so gitdesk works on its own. If a newer
+`workspace-doctor` sits at the `doctor` path in `config.json`, its patterns are used
+instead. **The scan is never skipped** — a tool that commits and pushes and quietly loses
+its failsafe is worse than no tool.
 
 ## Status
 

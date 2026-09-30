@@ -156,23 +156,100 @@ def norm_key(p: str | Path) -> str:
 # --------------------------------------------------------------------------
 
 
-def load_doctor(conf: dict):
-    """Laduje doctor.py ze sciezki z configu.
+class BuiltinDoctor:
+    """The parts of workspace-doctor gitdesk uses, built in — so a clone of gitdesk alone
+    works. The secret scan is never skipped: a tool that commits and pushes and quietly
+    loses its failsafe is worse than no tool. When workspace-doctor sits next to gitdesk
+    (the "doctor" path in config.json), its newer patterns win."""
 
-    Brak pliku to twardy blad, nie ciche pominiecie: gitdesk pozwala commitowac
-    i pushowac, a jedyne, co stoi miedzy tym a wyciekiem klucza, to skan doktora.
-    Narzedzie, ktore po cichu wylacza swoj failsafe, jest gorsze niz jego brak.
-    """
+    SKIP_DIRS = {
+        "node_modules", ".git", ".venv", "venv", "__pycache__", "dist", "build",
+        "bin", "obj", ".next", "target", ".ruff_cache", "vendor", ".turbo",
+        "site-packages", ".mypy_cache", ".pytest_cache",
+    }
+    MAX_SCAN_BYTES = 2 * 1024 * 1024
+    # file names that usually hold secrets
+    SECRET_FILE_RE = re.compile(
+        r"(^|/)("
+        r"\.env($|\.(?!example|template|sample))"
+        r"|.*\.(pem|key|p12|pfx|jks|keystore)$"
+        r"|credentials?\.(json|ya?ml|ini)$"
+        r"|secrets?\.(json|ya?ml|ini|py)$"
+        r"|service-account.*\.json$"
+        r"|id_rsa$|id_ed25519$"
+        r"|\.npmrc$|\.pypirc$|\.netrc$"
+        r")",
+        re.IGNORECASE,
+    )
+    # real key formats — each has a recognizable prefix, so few false alarms
+    SECRET_CONTENT = [
+        ("Anthropic API key", re.compile(rb"sk-ant-[A-Za-z0-9_\-]{20,}")),
+        ("OpenAI API key", re.compile(rb"sk-[A-Za-z0-9]{32,}")),
+        ("GitHub token", re.compile(rb"gh[pousr]_[A-Za-z0-9]{30,}")),
+        ("GitHub PAT", re.compile(rb"github_pat_[A-Za-z0-9_]{40,}")),
+        ("AWS access key", re.compile(rb"AKIA[0-9A-Z]{16}")),
+        ("Google API key", re.compile(rb"AIza[0-9A-Za-z_\-]{35}")),
+        ("Slack token", re.compile(rb"xox[baprs]-[A-Za-z0-9\-]{10,}")),
+        ("Stripe live key", re.compile(rb"(sk|rk)_live_[A-Za-z0-9]{20,}")),
+        ("Discord bot token", re.compile(rb"[MNO][A-Za-z0-9_\-]{23,25}\.[A-Za-z0-9_\-]{6}\.[A-Za-z0-9_\-]{27,}")),
+        ("PEM private key", re.compile(rb"-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----")),
+    ]
+    PLACEHOLDER_RE = re.compile(
+        rb"(?i)(fake|example|dummy|sample|placeholder|your[_\-]?|xxxx+|0000+|"
+        rb"changeme|redacted|insert[_\-]?|<[a-z_\-]+>|test[_\-]?key|abc123)"
+    )
+
+    @classmethod
+    def looks_synthetic(cls, token: bytes) -> bool:
+        """A made-up token rather than a generated one (six letters of the alphabet in a
+        row never happen in a random key) — so test suites don't show up as leaks."""
+        if cls.PLACEHOLDER_RE.search(token):
+            return True
+        run = 1
+        for a, b in zip(token, token[1:]):
+            run = run + 1 if b == a + 1 else 1
+            if run >= 6:
+                return True
+        body = token.split(b"_")[-1]
+        return len(body) >= 12 and len(set(body)) <= 4
+
+    @staticmethod
+    def git(repo: Path, *args: str) -> str | None:
+        try:
+            out = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+                                 timeout=60, encoding="utf-8", errors="replace")
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout if out.returncode == 0 else None
+
+    @classmethod
+    def walk(cls, root: Path):
+        stack = [root]
+        while stack:
+            try:
+                entries = list(os.scandir(stack.pop()))
+            except OSError:
+                continue
+            for e in entries:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if e.name not in cls.SKIP_DIRS:
+                            stack.append(Path(e.path))
+                    elif e.is_file(follow_symlinks=False):
+                        yield Path(e.path), e.stat().st_size
+                except OSError:
+                    continue
+
+
+def load_doctor(conf: dict):
+    """workspace-doctor from the path in the config when it is there, else the built-in copy
+    of its secret scan (BuiltinDoctor). Either way the scan runs — never a silent skip."""
     raw = conf.get("doctor", CONFIG_DEFAULT["doctor"])
     path = Path(raw)
     if not path.is_absolute():
         path = (HERE / path).resolve()
     if not path.is_file():
-        sys.exit(
-            f"BLAD: nie znalazlem workspace-doctor pod {path}\n"
-            f"       gitdesk nie uruchomi sie bez skanu sekretow.\n"
-            f"       Popraw pole 'doctor' w {CONFIG_PATH.name}."
-        )
+        return BuiltinDoctor
     spec = importlib.util.spec_from_file_location("wsdoctor", path)
     if spec is None or spec.loader is None:
         sys.exit(f"BLAD: nie moge zaladowac {path} jako modulu.")
