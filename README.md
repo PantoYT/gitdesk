@@ -1,139 +1,131 @@
 # gitdesk
 
-Panel nad **wszystkimi** repozytoriami na maszynie — nie nad jednym naraz.
+One panel over **every** repository on the machine — not one at a time.
 
-GitHub Desktop nie umie przeskanowac dysku (prosby otwarte od 2017: [#1574](https://github.com/desktop/desktop/issues/1574), [#19662](https://github.com/desktop/desktop/issues/19662)),
-wiec kazde repo dodaje sie recznie. Ale brak skanowania to nie jest prawdziwy
-problem. Prawdziwy problem to pytania, ktorych zaden klient nie zadaje, bo widzi
-tylko jedno repo:
+GitHub Desktop can't scan a disk (requests open since 2017: [#1574](https://github.com/desktop/desktop/issues/1574), [#19662](https://github.com/desktop/desktop/issues/19662)),
+so every repo is added by hand. But the missing scan isn't the real problem. The real
+problem is the questions no client asks, because each one only sees a single repo:
 
-- gdzie nie ma commita, a gdzie commit jest, ale nie ma pusha
-- co jest publiczne, a co prywatne
-- **ktora kopia robocza jest z przodu**, gdy to samo repo lezy na PC i na pendrivie
-- gdzie sekret jest o jeden `git add -A` od wyciekniecia
-- co niesie kopia wdrozeniowa bez `.git`, ktorej zaden klient nie widzi
+- where there's no commit, and where there's a commit but no push
+- what is public and what is private
+- **which working copy is ahead**, when the same repo lives on the PC and on a USB drive
+- where a secret is one `git add -A` away from leaking
+- what a deployment copy without `.git` carries, which no client can see
 
-## Uzycie
+## Usage
 
 ```
-python gitdesk.py list            # raport (dane z cache remote'ow)
-python gitdesk.py list --fetch    # najpierw odswiez remote'y - wolniej, ale prawdziwie
-python gitdesk.py twins           # tylko grupy blizniakow
-python gitdesk.py scan            # przeskanuj i zapisz cache
-python gitdesk.py list --json     # do skryptow
-python gitdesk.py serve           # panel; cache od razu, swiezy skan w tle
+python gitdesk.py list            # report (remote data from the cache)
+python gitdesk.py list --fetch    # refresh the remotes first - slower, but true
+python gitdesk.py twins           # only the groups of twins
+python gitdesk.py scan            # scan and save the cache
+python gitdesk.py list --json     # for scripts
+python gitdesk.py serve           # the panel; the cache at once, a fresh scan in the background
 ```
 
-Panel odpytuje repozytoria rownolegle (do 16 naraz), ale nie blokuje pierwszego
-ekranu. Domyslny filtr `do-zrobienia` pokazuje tylko repo brudne, do push, do
-pull albo wymagajace decyzji.
+The panel queries repositories in parallel (up to 16 at a time) without blocking the first
+screen. The default filter (`do-zrobienia`, "to do") shows only repos that are dirty, need
+a push or a pull, or need a decision.
 
-`synchronizuj bezpiecznie` wykonuje kolejno: fetch wszystkich, push gotowych
-commitow, ponowny fetch i pull `--ff-only` czystych kopii bedacych z tylu.
-Brudnego repo nie commituje automatycznie — opis zmiany trzeba wpisac przy nim;
-przycisk `commit + push` robi wtedy oba kroki. Jesli brudna kopia jest jednoczesnie
-z tylu, najpierw trzeba polaczyc historie recznie, bo panel swiadomie nie rozstrzyga
-konfliktow.
+`synchronizuj bezpiecznie` ("sync safely") runs, in order: fetch everything, push ready
+commits, fetch again and `pull --ff-only` the clean copies that are behind. It never
+commits a dirty repo on its own — the commit message goes in next to it, and the
+`commit + push` button then does both. If a dirty copy is also behind, the histories have
+to be joined by hand first: the panel deliberately doesn't resolve conflicts.
 
-Pierwsze uruchomienie tworzy `config.json` z domyslnymi ustawieniami.
+The first run creates `config.json` with the defaults.
 
-## Swiezosc danych, czyli dlaczego `--fetch`
+## Fresh data, or why `--fetch`
 
-`git status` liczy ahead/behind wzgledem `origin/...` zapisanego lokalnie przy
-**ostatnim fetchu**. Repo, ktorego nie fetchowano od 111 dni, moze byc 20
-commitow z tylu, a status pokaze zero i bedzie formalnie poprawny.
+`git status` counts ahead/behind against the `origin/...` stored locally at the **last
+fetch**. A repo nobody fetched for 111 days can be 20 commits behind while status says zero
+— and is formally right.
 
-Dlatego werdykt „zgodne" pojawia sie tylko przy swiezym fetchu (< 24 h). Bez
-niego jest `niezweryfikowane`. Rozjazd i wyprzedzenie pokazuja sie zawsze —
-lokalny commit jest faktem niezaleznie od tego, kiedy ostatnio pytalismy zdalnego.
+So the verdict "in sync" (`zgodne`) only appears with a fresh fetch (< 24 h). Without one
+it's `niezweryfikowane` ("unverified"). Being diverged or ahead always shows — a local
+commit is a fact no matter when the remote was last asked.
 
-## Blizniaki
+## Twins
 
-Kopie robocze wskazujace na ten sam remote. Werdykt liczony jest **bez siegania
-miedzy repo**: kazda kopia ma wlasne `origin/<branch>`, wiec porownanie ahead/behind
-kazdej z osobna wystarczy. `git merge-base A B` tu nie zadziala — to osobne bazy
-obiektow, kopia z PC nie zna commitow z pendrive'a.
+Working copies pointing at the same remote. The verdict is computed **without reaching
+across repos**: each copy has its own `origin/<branch>`, so comparing each one's
+ahead/behind is enough. `git merge-base A B` doesn't work here — they are separate object
+databases; the PC copy doesn't know the USB drive's commits.
 
-## Etykiety intencji
+## Intent labels
 
-Bez nich narzedzie zglasza jako usterke kazde repo bez zdalnego — a wtedy uczy,
-zeby ignorowac czerwone. W `config.json`:
+Without them the tool reports every repo without a remote as a problem — and teaches you
+to ignore red. In `config.json`:
 
-- `local_only` — celowo bez remote'a, prywatne narzedzie. Widoczne na szaro,
-  bez nagabywania o GitHuba.
-- `foreign` — nie moj kod. Zero akcji zapisujacych.
+- `local_only` — deliberately without a remote, a private tool. Shown in grey, no nagging
+  about GitHub.
+- `foreign` — not my code. No write actions at all.
 
-## Wdrozenia
+## Deployments
 
-Kopie bez `.git` (np. dropgate na pendrivie). Dzialaja, ale cicho sie starzeja —
-`git log` nie odpowie, bo nie ma czego pytac. `gitdesk` porownuje tresc plik po
-pliku z HEAD repo zrodlowego i osobno zglasza, co takiego kopia niesie, czego w
-repo nie ma: to wlasnie tam laduja klucze, ktore gitignore slusznie trzyma poza
-repo, a ktore razem z nosnikiem wychodza z domu.
+Copies without `.git` (e.g. dropgate on a USB drive). They work, but quietly go stale —
+`git log` can't answer, there's nothing to ask. `gitdesk` compares the content file by file
+with the source repo's HEAD, and separately reports what the copy carries that the repo
+doesn't: that's exactly where keys end up, the ones gitignore rightly keeps out of the
+repo and that leave the house with the drive.
 
-## Graf historii
+## History graph
 
-`graf` przy kazdym repo rysuje DAG w SVG — przydzial torow to ten sam pomysl,
-ktory `git log --graph` rysuje w ASCII. Merge ma puste kolko i dwie krawedzie
-wchodzace.
+`graf` next to each repo draws the DAG as SVG — lane assignment is the same idea
+`git log --graph` draws in ASCII. A merge is a hollow circle with two incoming edges.
 
-`graf blizniakow` pokazuje **obie kopie robocze na jednym obrazku**: wspolny
-przodek i dwa rozchodzace sie ogony, kazdy commit oznaczony jako „obie",
-„tylko A" albo „tylko B". Tego nie zrobi zaden klient gita, bo zaden nie wie,
-ze to samo repo masz w dwoch miejscach.
+`graf blizniakow` ("twins graph") shows **both working copies in one picture**: the common
+ancestor and two diverging tails, each commit marked "both", "only A" or "only B". No git
+client does this, because none knows you have the same repo in two places.
 
-Pulapka, ktora to wymusza: **`git merge-base A B` miedzy dwoma klonami nie
-zadziala** — to osobne bazy obiektow, kopia z PC nie zna commitow z pendrive'a.
-Historia drugiej kopii jest wiec pobierana `fetch`em po sciezce lokalnej (bez
-sieci) do tymczasowego refa `refs/gitdesk/twin`, ktory jest kasowany zaraz po
-narysowaniu. Kopie archiwalne sa z tego wylaczone — fetch dopisalby im obiekty.
+The trap that forces this: **`git merge-base A B` between two clones doesn't work** —
+separate object databases, the PC copy doesn't know the drive's commits. So the other copy's
+history is fetched over a local path (no network) into a temporary ref
+`refs/gitdesk/twin`, deleted right after drawing. Archive copies are left out — the fetch
+would add objects to them.
 
-## Gdzie to wystawiac
+## Where to expose it
 
-`--bind local` (domyslnie) albo `--bind tailnet`. **Nie przez tunel publiczny.**
+`--bind local` (the default) or `--bind tailnet`. **Never through a public tunnel.**
 
-Panel wykonuje `add`, `commit`, `reset`, `push` i `pull` na kilkudziesieciu
-repozytoriach, uzywajac poswiadczen, ktore maszyna juz ma — Git Credential
-Manager i `gh` sa zalogowane. Nie ma tu tokenu do wykradzenia, bo zaden nie jest
-potrzebny: kto dojdzie do panelu, pushuje jako wlasciciel konta. Token sesji
-jest zabezpieczeniem przed CSRF, nie systemem logowania.
+The panel runs `add`, `commit`, `reset`, `push` and `pull` on dozens of repositories with
+the credentials the machine already has — Git Credential Manager and `gh` are logged in.
+There's no token to steal because none is needed: whoever reaches the panel pushes as the
+account owner. The session token protects against CSRF; it is not a login system.
 
-Potrzebujesz dostepu z telefonu? Siec prywatna, gdzie uwierzytelnieniem jest
-tozsamosc WireGuarda — `--bind tailnet`. Wtedy panel widzi caly tailnet i
-narzedzie o tym glosno mowi przy starcie.
+Need it from a phone? A private network where WireGuard identity is the authentication —
+`--bind tailnet`. The panel then faces the whole tailnet, and the tool says so loudly at
+start.
 
-## Testy
+## Tests
 
 ```
 python gitdesk.py --selftest
 ```
 
-20 asercji na tymczasowych repo w `%TEMP%`. Sprawdza to, czego awaria bylaby
-**cicha**: blokada commita z sekretem nie krzyczy, kiedy przestaje dzialac —
-po prostu przepuszcza.
+20 assertions on temporary repos in `%TEMP%`. They check what would fail **silently**: a
+commit block for secrets doesn't shout when it stops working — it just lets things through.
 
-Pierwszy przebieg tego testu znalazl dwa realne bledy: `probe()` czytal czas
-fetcha wylacznie z `FETCH_HEAD`, ktorego swiezy klon nie ma (kazde nowo
-sklonowane repo raportowalo „stan nieznany"), a sam test blokady sekretow
-przechodzilby za darmo, bo globalny gitignore tej maszyny zawiera `.env` i plik
-nigdy nie trafialby do indeksu.
+The first run of this test found two real bugs: `probe()` read the fetch time only from
+`FETCH_HEAD`, which a fresh clone doesn't have (every newly cloned repo reported "state
+unknown"), and the secret-block test itself would have passed for free, because this
+machine's global gitignore contains `.env` and the file never reached the index.
 
-## Zaleznosci
+## Dependencies
 
-Zadnych zewnetrznych — sama biblioteka standardowa (Python 3.14).
+None outside the standard library (Python 3.14).
 
-Skan sekretow nie jest tu pisany od nowa: `gitdesk` laduje
-[`workspace-doctor`](../workspace-doctor) jako modul i uzywa jego wzorcow oraz
-`looks_synthetic()`. **Brak doktora to twardy blad startu**, nie ciche pominiecie
-— narzedzie, ktore po cichu wylacza swoj failsafe, jest gorsze niz jego brak.
+The secret scan isn't written again here: `gitdesk` loads
+[`workspace-doctor`](../workspace-doctor) as a module and uses its patterns and
+`looks_synthetic()`. **A missing doctor is a hard error at start**, not a silent skip — a
+tool that quietly switches off its failsafe is worse than no tool.
 
-## Stan
+## Status
 
-Gotowe: odkrywanie, stan repo, fetch, widocznosc, blizniaki, wdrozenia, panel
-w przegladarce z akcjami, trzy widoki (lista / kafelki / grupy), selftest i graf
-historii wraz z grafem blizniakow.
+Done: discovery, repo state, fetch, visibility, twins, deployments, a browser panel with
+actions, three views (list / tiles / groups), selftest, and the history graph including
+the twins graph.
 
-Swiadomie poza zakresem: **merge tool**. Nie z powodu pracochlonnosci, tylko
-ryzyka — konflikt zdarza sie rzadko, wiec takie narzedzie jest najslabiej
-przetestowane dokladnie wtedy, gdy jest najbardziej potrzebne, a koszt bledu to
-utracona praca. Od konfliktu dalej jest `git`.
+Deliberately out of scope: a **merge tool**. Not because of the work, but the risk — a
+conflict is rare, so such a tool is least tested exactly when it's needed most, and the
+cost of a bug is lost work. From a conflict on, it's `git`.
